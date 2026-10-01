@@ -1,0 +1,5 @@
+config.php
+.env
+.vscode/
+.idea/
+.DS_Store
