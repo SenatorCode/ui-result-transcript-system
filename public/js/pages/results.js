@@ -1,0 +1,25 @@
+import { shell, icon, emptyState, gradeLegend, escapeHtml } from '../components/ui.js';
+import { get } from '../core/api.js';
+
+export async function render({ profile, signal, params }) {
+  let options;
+  try { options = (await get('results/options.php', { signal })).pairs || []; }
+  catch (error) { return shell({ route: 'results', profile, content: heading() + `<section class="card">${emptyState('Results are unavailable', error.message, '<button class="btn" data-action="retry-page">Try again</button>')}</section>` }); }
+  const saved = localStorage.getItem('lastResultPair');
+  let savedPair = null;
+  try { savedPair = saved ? JSON.parse(saved) : null; } catch { localStorage.removeItem('lastResultPair'); }
+  const queryPair = { session: params?.get('session'), semester: params?.get('semester') };
+  const pair = options.find(p => p.session === queryPair.session && p.semester === queryPair.semester) || options.find(p => p.session === savedPair?.session && p.semester === savedPair?.semester) || options.find(p => p.released) || options[0];
+  let result = null, error = null;
+  if (pair) try { result = await get(`results/index.php?session=${encodeURIComponent(pair.session)}&semester=${encodeURIComponent(pair.semester)}`, { signal }); } catch (e) { error = e; }
+  const selectors = options.length ? `<div class="card results-toolbar"><div class="field toolbar-field"><label for="sessionPicker">Academic session</label><select id="sessionPicker" data-picker="session">${unique(options.map(p => p.session)).map(s => `<option ${s === pair?.session ? 'selected' : ''}>${escapeHtml(s)}</option>`).join('')}</select></div><div class="field toolbar-field"><label for="semesterPicker">Semester</label><select id="semesterPicker" data-picker="semester">${options.filter(p => p.session === pair?.session).map(p => `<option ${p.semester === pair?.semester ? 'selected' : ''}>${escapeHtml(p.semester)}</option>`).join('')}</select></div><button class="btn btn-small" data-action="load-results">Show results ${icon('arrow', 16)}</button></div>` : '';
+  let body = '';
+  if (!options.length) body = `<section class="card">${emptyState('No results are available yet', 'When results are published for a session and semester, you can view them here.')}</section>`;
+  else if (error) body = `<section class="card">${emptyState('Results could not load', error.message, '<button class="btn" data-action="retry-page">Retry</button>')}</section>`;
+  else if (result?.availability === 'pending' || result?.availability === 'withheld') body = `<section class="card card-pad">${icon('clock', 24)}<h2 class="section-title">${result.availability === 'pending' ? 'Results not released yet' : 'Results are withheld'}</h2><p class="section-copy">${escapeHtml(result.message || 'Check back after Registry updates this result.')}</p></section>`;
+  else if (!result || result.availability === 'empty' || !result.courses?.length) body = `<section class="card">${emptyState('No courses in this semester', 'There are no released course results for this session and semester.')}</section>`;
+  else body = `<section class="results-summary"><article class="summary-cell"><small>Semester GPA</small><strong>${Number(result.summary.gpa).toFixed(2)}</strong></article><article class="summary-cell"><small>Cumulative GPA</small><strong>${Number(result.summary.cgpa).toFixed(2)}</strong></article><article class="summary-cell"><small>Degree classification</small><strong class="degree-text">${escapeHtml(result.summary.degreeClass || '—')}</strong></article></section><div class="units-bar"><span>Units registered <strong>${result.summary.unitsRegistered}</strong></span><span>Units earned <strong>${result.summary.unitsEarned}</strong></span></div><section class="card table-wrap" aria-label="Course results"><table class="results-table"><thead><tr><th scope="col">Course</th><th scope="col">Registered</th><th scope="col">Earned</th><th scope="col">Grade</th><th scope="col">Attempt</th></tr></thead><tbody>${result.courses.map(c => `<tr><td><span class="course-code">${escapeHtml(c.code)}</span><span class="course-title">${escapeHtml(c.title)}</span></td><td>${c.units}</td><td>${c.unitsEarned}</td><td><span class="grade-chip grade-${escapeHtml(c.grade)}" aria-label="Grade ${escapeHtml(c.grade)}">${escapeHtml(c.grade)}</span></td><td>${c.attempt}${c.carryOver ? ' <span class="carry-chip">Carry-over</span>' : ''}</td></tr>`).join('')}</tbody></table></section><section class="card" style="margin-top:16px"><div class="section-head" style="padding:15px 18px 0"><div><h2 class="section-title">Grading scale</h2><p class="section-copy">Five-point scale</p></div></div>${gradeLegend()}</section>`;
+  return shell({ route: 'results', profile, content: heading() + selectors + body });
+}
+const heading = () => `<header class="page-heading"><div><p class="eyebrow">Academic record</p><h1>Results</h1><p class="page-subtitle">Your published grades and academic standing.</p></div></header>`;
+const unique = values => [...new Set(values)];

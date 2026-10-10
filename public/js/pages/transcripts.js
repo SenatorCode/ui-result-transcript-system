@@ -1,0 +1,50 @@
+import { shell, icon, emptyState, money, date, statusBadge, escapeHtml, alertBox } from '../components/ui.js';
+import { get } from '../core/api.js';
+
+export async function render({ profile, signal }) {
+  let items;
+  try { items = (await get('transcripts/index.php', { signal })).items || []; }
+  catch (error) { return shell({ route: 'transcripts', profile, content: heading() + `<section class="card">${emptyState('Requests could not load', error.message, '<button class="btn" data-action="retry-page">Retry</button>')}</section>` }); }
+  const showForm = new URLSearchParams(location.hash.split('?')[1] || '').has('new');
+  const content = heading() + (showForm ? requestForm() : `<div class="section-head"><span class="section-copy">${items.length} request${items.length === 1 ? '' : 's'}</span><div class="transcript-list-tools"><button class="btn btn-secondary btn-small" data-action="refresh-list">Refresh statuses</button><a class="btn btn-small" href="#/transcripts?new=1">${icon('file', 17)} New transcript request</a></div></div>${items.length ? `<div class="transcript-list">${items.map(card).join('')}</div>` : `<section class="card">${emptyState('No transcript requests yet', 'Request an official copy for yourself or have one sent to another institution.', '<a class="btn" href="#/transcripts?new=1">Start a request</a>')}</section>`}`);
+  return shell({ route: 'transcripts', profile, content });
+}
+
+function heading() { return `<header class="page-heading"><div><p class="eyebrow">Registry services</p><h1>Transcripts</h1><p class="page-subtitle">Request a copy, follow its status, and take the next available action.</p></div></header>`; }
+function card(item) {
+  const destination = item.destination?.label || 'Transcript request';
+  const institutionSent = item.status === 'sent' && item.destination?.type === 'institution';
+  const buttons = (item.allowedActions || []).map(action => {
+    if (action === 'pay') return `<button class="btn" data-action="pay" data-id="${escapeHtml(item.id)}">Pay ${money(item.feeAmount)}</button>`;
+    if (action === 'cancel') return `<button class="btn btn-secondary" data-action="cancel" data-id="${escapeHtml(item.id)}">Cancel request</button>`;
+    if (action === 'download' && !institutionSent && item.destination?.type === 'personal') return `<button class="btn btn-secondary" data-action="download" data-id="${escapeHtml(item.id)}">${icon('arrow-down', 17)} Download or print</button>`;
+    if (action === 'receipt') return `<button class="btn btn-quiet" data-action="receipt" data-id="${escapeHtml(item.id)}">View receipt</button>`;
+    if (action === 'retry') return `<button class="btn" data-action="retry-payment" data-id="${escapeHtml(item.id)}">Try payment again</button>`;
+    return '';
+  }).join('');
+  const statusText = item.status === 'rejected' && item.rejectionReason ? `<div class="inline-alert tone-error" style="margin:0 0 14px">${icon('alert', 17)}<span>${escapeHtml(item.rejectionReason)}</span></div>` : '';
+  return `<article class="card transcript-card"><div class="transcript-top"><div><h2 class="transcript-id">${escapeHtml(item.id)}</h2><p class="transcript-dest">${institutionSent ? `Sent to ${escapeHtml(destination)}` : escapeHtml(destination)}${item.deliveryMethod ? ` · ${escapeHtml(item.deliveryMethod)}` : ''}</p></div>${statusBadge(item.status)}</div><div class="status-explainer">${escapeHtml(item.status === 'pending_payment' ? 'Pay to start Registry processing. You can cancel this unpaid request.' : item.status === 'payment_processing' ? 'Payment is being verified. Refresh this list to check for an update.' : item.status === 'processing' ? 'Registry is preparing your official transcript.' : item.status === 'failed' ? 'Payment or fulfilment did not complete. Use the available action or contact Registry.' : item.status === 'rejected' ? 'Registry reviewed this request and could not complete it.' : item.status === 'expired' ? 'This unpaid quote has expired. Create a new request for a current fee.' : item.status === 'cancelled' ? 'This request is closed.' : item.status === 'sent' ? 'Registry has dispatched this transcript to its destination.' : item.status === 'ready' ? 'Your personal PDF is ready to download.' : 'Payment has been verified.')}</div>${statusText}<div class="transcript-meta"><span><strong>Fee</strong> ${money(item.feeAmount)}</span><span><strong>Copies</strong> ${item.copies}</span><span><strong>Requested</strong> ${date(item.createdAt)}</span>${item.payment?.paidAt ? `<span><strong>Paid</strong> ${date(item.payment.paidAt)}</span>` : ''}</div>${buttons ? `<div class="transcript-actions">${buttons}</div>` : ''}</article>`;
+}
+
+function requestForm() {
+  return `<section class="step-indicator" aria-label="Request steps"><span class="step-pill is-current"></span><span class="step-pill"></span><span class="step-pill"></span></section><div id="transcript-form-area"><div class="form-layout"><div><section class="card form-section"><h2>Where should it go?</h2><div class="choice-grid"><label class="choice-card"><input type="radio" name="destinationType" value="personal" checked><span><strong>Personal copy</strong><small>Download your official transcript</small></span></label><label class="choice-card"><input type="radio" name="destinationType" value="institution"><span><strong>Send to an institution</strong><small>Deliver it to another university or office</small></span></label></div><div id="institution-fields" hidden><div class="form-grid" style="margin-top:16px"><div class="field span-all"><label for="institutionName">Institution name</label><input id="institutionName" name="institutionName" autocomplete="organization"></div><div class="field"><label for="destinationAddress">Postal address</label><textarea id="destinationAddress" name="destinationAddress" autocomplete="street-address"></textarea></div><div class="field"><label for="destinationEmail">Email address</label><input id="destinationEmail" name="destinationEmail" type="email" autocomplete="email"></div><p class="section-copy span-all">Enter either a postal address or an email address.</p></div></div></section><section class="card form-section"><h2>Delivery and copies</h2><div class="form-grid"><div class="field"><label for="deliveryMethod">Delivery method</label><select id="deliveryMethod" name="deliveryMethod"><option value="download" data-personal-only>Secure download</option><option value="email" data-institution-only>Email</option><option value="courier" data-institution-only>Courier</option></select></div><div class="field"><label for="copies">Number of copies</label><select id="copies" name="copies"><option>1</option><option>2</option><option>3</option></select></div></div></section></div><aside class="card quote-card"><p class="eyebrow">Fee quote</p><h2 class="section-title">Confirm your options</h2><p class="section-copy">We’ll fetch the current fee before you review.</p><div id="quote-status" class="status-explainer">The quote is loaded when you continue.</div><button class="btn btn-block" style="margin-top:18px" data-action="review-request">Review request ${icon('arrow', 17)}</button><a class="text-link" href="#/transcripts" style="margin-top:8px">Cancel and go back</a></aside></div></div>`;
+}
+
+export async function reviewRequest(form, signal) {
+  const data = Object.fromEntries(new FormData(form));
+  const destinationMissing = data.destinationType === 'institution' && (!data.institutionName?.trim() || (data.deliveryMethod === 'email' && !data.destinationEmail?.trim()) || (data.deliveryMethod === 'courier' && !data.destinationAddress?.trim()));
+  if (destinationMissing) {
+    const area = document.querySelector('#quote-status');
+    if (area) area.innerHTML = alertBox('Add the institution name and the destination details required by the delivery method.', 'error');
+    return null;
+  }
+  const quote = await get(`transcripts/quote.php?destinationType=${encodeURIComponent(data.destinationType)}&deliveryMethod=${encodeURIComponent(data.deliveryMethod)}&copies=${encodeURIComponent(data.copies)}`, { signal, forceRefresh: true });
+  return { data, quote };
+}
+
+export function reviewMarkup({ data, quote }) {
+  const destination = data.destinationType === 'personal' ? 'Personal copy' : data.institutionName;
+  const deliveryLabel = { download: 'Secure download', email: 'Email', courier: 'Courier' }[data.deliveryMethod] || data.deliveryMethod;
+  const destinationValue = data.deliveryMethod === 'email' ? data.destinationEmail : data.destinationAddress;
+  return `<div class="form-layout"><section class="card form-section"><p class="eyebrow">Review request</p><h2>Check these details</h2><div class="review-list"><div class="review-row"><span>Destination</span><strong>${escapeHtml(destination)}</strong></div>${data.destinationType === 'institution' ? `<div class="review-row"><span>${data.deliveryMethod === 'email' ? 'Email address' : 'Postal address'}</span><strong>${escapeHtml(destinationValue)}</strong></div>` : ''}<div class="review-row"><span>Delivery</span><strong>${escapeHtml(deliveryLabel)}</strong></div><div class="review-row"><span>Copies</span><strong>${escapeHtml(data.copies)}</strong></div><div class="review-row"><span>Fee</span><strong>${money(quote.feeAmount)}</strong></div><div class="review-row"><span>Quote expires</span><strong>${new Intl.DateTimeFormat('en-NG', { timeStyle: 'short', timeZone: 'Africa/Lagos' }).format(new Date(quote.expiresAt))}</strong></div></div><div class="inline-alert tone-warning">${icon('alert', 17)}<span>You’ll pay after the request is created. Confirm the destination before continuing.</span></div><div class="transcript-actions" style="margin-top:18px"><button class="btn btn-secondary" data-action="edit-request">Edit details</button><button class="btn" data-action="submit-request">Create request ${icon('arrow', 16)}</button></div></section><aside class="card quote-card"><p class="eyebrow">Quote</p><p class="quote-price">${money(quote.feeAmount)}</p><p class="section-copy">Current fee · NGN</p></aside></div>`;
+}
