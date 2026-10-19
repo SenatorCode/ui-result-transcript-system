@@ -44,7 +44,7 @@
         return [ 'id'    => (int)$row['id'],
             'code'       => $row['code'],
             'title'      => $row['title'],
-            'unit'       => (int)$row['unit'],
+            'units'       => (int)$row['unit'],
             'department' => $row['department'],
         ];
             
