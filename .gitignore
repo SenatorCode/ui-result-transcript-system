@@ -3,3 +3,7 @@ config.php
 .vscode/
 .idea/
 .DS_Store
+
+# Logs (reset links, error logs) stay on your machine; the folder itself is kept.
+storage/logs/*
+!storage/logs/.gitkeep

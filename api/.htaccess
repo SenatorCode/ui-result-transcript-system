@@ -1,3 +1,11 @@
+# Owner: Dev A. Sends every api/**.php URL to the front controller, so the contract URLs
+# (api/auth/login.php, api/results/index.php, ...) keep their .php ending.
+Options -Indexes
 RewriteEngine On
-RewriteCond %{REQUEST_FILENAME} !index.php
+
+# The front controller itself is served as normal.
+RewriteRule ^index\.php$ - [L]
+
+# Everything else ending in .php (including results/index.php and transcripts/index.php,
+# which are real contract URLs) goes through it. This also hides bootstrap.php and routes_*.php.
 RewriteRule ^(.+)\.php$ index.php [L,QSA]
