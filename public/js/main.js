@@ -57,8 +57,9 @@ async function init() {
     catch (error) {
       setAuthState(false);
       if (error.status === 401 && !['login', 'forgot-password', 'reset-password'].includes(route)) {
-        sessionStorage.setItem('resumeRoute', location.hash.replace(/^#\/?/, '') || 'home');
-        location.hash = '#/login?expired=1';
+        // A first visit (no route yet) is not an expired session: go to login without the warning.
+        if (route && route !== 'home') sessionStorage.setItem('resumeRoute', location.hash.replace(/^#\/?/, ''));
+        location.hash = '#/login';
       }
     }
   }
@@ -181,7 +182,7 @@ document.addEventListener('click', async event => {
       const module = await import('./pages/transcripts.js');
       const area = document.querySelector('#transcript-form-area');
       // FormData requires a form element; collect controls from the request step into a temporary form.
-      const temp = document.createElement('form'); area.querySelectorAll('input,select,textarea').forEach(control => { const clone = control.cloneNode(); if (control.type === 'radio') clone.checked = control.checked; else clone.value = control.value; temp.append(clone); });
+      const temp = document.createElement('form'); area.querySelectorAll('input,select,textarea').forEach(control => { if (!control.name || (control.type === 'radio' && !control.checked)) return; const field = document.createElement('input'); field.name = control.name; field.value = control.value; temp.append(field); });
       const draft = await module.reviewRequest(temp, lastRender?.context?.signal);
       if (!draft) { setBusy(button, false); return; }
       reviewDraft = { ...draft, formHtml: area.innerHTML }; area.innerHTML = module.reviewMarkup(draft);
@@ -197,7 +198,8 @@ document.addEventListener('click', async event => {
     setBusy(target, true, 'Creating request…'); requestKey ||= key();
     try {
       const { data, quote } = reviewDraft;
-      const body = { ...data, quoteExpiresAt: quote.expiresAt };
+      // Send only what the contract asks for: no empty strings, copies as a number.
+      const body = Object.fromEntries(Object.entries({ ...data, copies: Number(data.copies), quoteExpiresAt: quote.expiresAt }).filter(([, value]) => value !== ''));
       await post('transcripts/create.php', body, { idempotencyKey: requestKey }); requestKey = null; reviewDraft = null;
       showToast('Transcript request created.'); navigate('transcripts');
     } catch (error) { setBusy(target, false); showToast(error.message); }
