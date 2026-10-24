@@ -169,7 +169,7 @@ Any other transition returns `409 invalid_transition`. `Transcript::adminActions
 | Admins | `registry.admin` or `finance.admin` | `Admin@1234` |
 
 - `CSC/2023/001`, 2025/2026 Second Semester returns CSC 204 with grade A.
-- `CSC/2023/001` CGPA at 2024/2025 Second Semester is 3.98, while the overall CGPA is 4.30.
+- `CSC/2023/001` CGPA at 2024/2025 Second Semester is 3.98, while the overall CGPA is 4.50 (4.25 if every attempt were counted). The issued snapshot for request `tr_1001` is 55 units and 4.50; `totalUnitsCounted()` is every result row on the record (55), while the CGPA itself uses only the latest attempt of each course (52 units).
 - `CSC/2023/002` has no 2025/2026 Second Semester results, so that request returns 404.
 - `CSC/2025/002` has no results at all, so `results/options` returns an empty list.
 - `CSC/2024/003` is suspended and cannot log in.
