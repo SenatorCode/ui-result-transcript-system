@@ -32,6 +32,7 @@ All examples below show the body inside the success envelope unless noted. All e
 | POST | `api/auth/password-reset.php` | Public, one-time token | Set new password |
 | GET | `api/results/options.php` | Student | Existing session/semester pairs |
 | GET | `api/results/index.php?session=2025%2F2026&semester=First%20Semester` | Student | Results and server calculations |
+| GET | `api/student/profile.php` | Student | The student's own profile (added by Dev A) |
 | GET | `api/transcripts/index.php` | Student | List transcript requests |
 | GET | `api/transcripts/quote.php?destinationType=personal` | Student | Get current fee quote |
 | POST | `api/transcripts/create.php` | Student + CSRF + idempotency | Create request |
@@ -67,7 +68,20 @@ No body. Requires CSRF. `200`: `{ "loggedOut": true }`; expire session cookie an
 
 `GET results/options.php` returns only pairs that exist and are visible to the student: `{ "pairs": [{ "session": "2025/2026", "semester": "First Semester", "released": true }, { "session": "2024/2025", "semester": "Second Semester", "released": false, "availability": "withheld" }] }`. Empty list is valid. `released` false may include `availability: "pending" | "withheld"` and a student-safe message.
 
-`GET results/index.php?...` returns `{ "session": "2025/2026", "semester": "First Semester", "availability": "released", "courses": [{ "code": "CSC 301", "title": "Data Structures", "units": 3, "unitsEarned": 3, "grade": "A", "gradePoint": 5, "attempt": 1, "carryOver": false }], "summary": { "gpa": 4.25, "cgpa": 3.91, "unitsRegistered": 18, "unitsEarned": 15, "degreeClass": "Second Class Honours (Upper Division)" } }`. Availability is `released`, `pending`, `withheld`, or `empty`; non-released states may omit courses/summary. Course and summary `unitsEarned` values follow university pass/retake rules; UI does not compute them. Include failed/carry-over attempts where appropriate. `404` when the requested pair does not exist for the student.
+`GET results/index.php?...` returns `{ "student": "CSC/2023/001", "session": "2025/2026", "semester": "First Semester", "availability": "released", "courses": [{ "code": "CSC 301", "title": "Data Structures", "units": 3, "unitsEarned": 3, "grade": "A", "gradePoint": 5, "attempt": 1, "carryOver": false }], "summary": { "gpa": 4.25, "cgpa": 3.91, "unitsRegistered": 18, "unitsEarned": 15, "degreeClass": "Second Class Honours (Upper Division)" } }`. Availability is `released`, `pending`, `withheld`, or `empty`; non-released states may omit courses/summary. Course and summary `unitsEarned` values follow university pass/retake rules; UI does not compute them. Include failed/carry-over attempts where appropriate. `404` when the requested pair does not exist for the student.
+
+`GET student/profile.php` returns `{ "student": { "id": "st_01", "fullName": "...", "matricNo": "CSC/2023/001", "email": "...", "phone": "...", "dateOfBirth": "2003-03-14", "faculty": "Faculty of Computing", "department": "Computer Science", "level": 300, "entrySession": "2023/2024", "status": "active" } }`. The student id always comes from the session.
+
+**Calculation rules (implemented in `classes/Academics.php`):**
+
+- GPA = sum(units x grade point) / sum(units), rounded half-up to 2 decimals (3.975 becomes 3.98).
+- A course taken again is a new `attempt`; `carryOver` is true when `attempt` is more than 1.
+- `unitsEarned` equals `units` unless the grade is F (then 0).
+- `cgpa` counts only the latest attempt of each course, using results up to and including the selected semester (a later retake never rewrites an earlier semester).
+- `degreeClass`: 4.50 and above First Class Honours; 3.50 Second Class Honours (Upper Division); 2.40 Second Class Honours (Lower Division); 1.50 Third Class Honours; 1.00 Pass; below that "Not classified". The bands live in `config.example.php`.
+- v1 treats every stored result as `released`. `pending` and `withheld` need a release-state table and are not produced yet.
+
+**Download order of checks:** malformed or foreign id is `404`, status not `ready`/`sent` is `409 invalid_transition`, institution copy is `403 forbidden`. Each successful download adds 1 to `download_count`.
 
 Grading scale (one source for UI display; backend remains authoritative for GPA):
 
