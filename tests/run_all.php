@@ -703,6 +703,158 @@ test('login: a successful login clears earlier failures', function () {
     b_login_cleanup();
 });
 
+section('Transcript state machine (Dev B)');
+
+/** Inserts a test request (request_no starts with TMP-T). Students 5, 7 and 8 have no open request in the seed. */
+function b_make_request(string $status = 'pending_payment', array $o = []): int
+{
+    $cols = array_merge([
+        'request_no' => 'TMP-T' . bin2hex(random_bytes(6)),
+        'student_id' => 7, 'status' => $status, 'fee_amount' => 5000,
+    ], $o);
+    $names = implode(', ', array_keys($cols));
+    $marks = implode(', ', array_fill(0, count($cols), '?'));
+    Database::execute("INSERT INTO transcript_requests ($names) VALUES ($marks)", array_values($cols));
+    return Database::lastInsertId();
+}
+
+function b_institution(): array
+{
+    return ['destination_type' => 'institution', 'institution_name' => 'Test University',
+            'delivery_method' => 'email', 'destination_email' => 'records@example.edu'];
+}
+
+function b_issue(): array
+{
+    return ['transcript_no' => 'TMPTN-' . bin2hex(random_bytes(5)), 'total_units' => 30,
+            'cgpa' => 4.0, 'ready_at' => gmdate('Y-m-d H:i:s')];
+}
+
+function b_requests_cleanup(): void
+{
+    Database::execute("DELETE FROM payments WHERE request_id IN (SELECT id FROM transcript_requests WHERE request_no LIKE 'TMP-T%')");
+    Database::execute("DELETE FROM transcript_requests WHERE request_no LIKE 'TMP-T%'");
+}
+
+function b_status(int $id): string
+{
+    return (string) Database::fetchOne('SELECT status FROM transcript_requests WHERE id = ?', [$id])['status'];
+}
+
+test('requests: every status pair is allowed or refused exactly as the table says', function () {
+    $allowed = [
+        'pending_payment>payment_processing', 'pending_payment>cancelled', 'pending_payment>expired',
+        'payment_processing>paid', 'payment_processing>failed',
+        'failed>payment_processing', 'failed>cancelled', 'failed>expired',
+        'paid>processing', 'paid>rejected',
+        'processing>rejected', 'processing>ready', 'processing>sent',
+    ];
+    $all = TranscriptStatus::all();
+    assert_same(10, count($all), 'ten statuses');
+    foreach ($all as $from) {
+        foreach ($all as $to) {
+            assert_same(in_array("$from>$to", $allowed, true), TranscriptStatus::canMove($from, $to), "$from to $to");
+        }
+    }
+});
+
+test('requests: a personal request walks to ready and gets its issue columns in one update', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment');
+    foreach (['payment_processing', 'paid', 'processing'] as $next) {
+        assert_same($next, Transcript::transition($id, $next)['status']);
+    }
+    $row = Transcript::transition($id, 'ready', b_issue());
+    assert_same('ready', $row['status']);
+    assert_true($row['transcript_no'] !== null && $row['ready_at'] !== null, 'issue columns saved');
+    assert_api_error('invalid_transition', 409, fn () => Transcript::transition($id, 'processing'));
+    assert_api_error('not_found', 404, fn () => Transcript::transition(999999, 'paid'));
+    b_requests_cleanup();
+});
+
+test('requests: ready is for personal copies, sent for institution copies', function () {
+    b_requests_cleanup();
+    $inst = b_make_request('processing', b_institution());
+    assert_api_error('invalid_transition', 409, fn () => Transcript::transition($inst, 'ready', b_issue()));
+    $row = Transcript::transition($inst, 'sent', b_issue() + ['sent_at' => gmdate('Y-m-d H:i:s')]);
+    assert_same('sent', $row['status']);
+    $pers = b_make_request('processing');
+    assert_api_error('invalid_transition', 409, fn () => Transcript::transition($pers, 'sent', b_issue() + ['sent_at' => gmdate('Y-m-d H:i:s')]));
+    b_requests_cleanup();
+});
+
+test('requests: reject stores the reason; a bad extra column rolls everything back', function () {
+    b_requests_cleanup();
+    $id = b_make_request('paid');
+    $thrown = false;
+    try {
+        Transcript::transition($id, 'processing', ['fee_amount' => 1]);
+    } catch (LogicException $e) {
+        $thrown = true;
+    }
+    assert_true($thrown, 'column outside the allow-list is refused');
+    assert_same('paid', b_status($id), 'status unchanged after the failed attempt');
+    $row = Transcript::transition($id, 'rejected', ['rejection_reason' => 'Results are under review.']);
+    assert_same('rejected', $row['status']);
+    assert_same('Results are under review.', $row['rejection_reason']);
+    b_requests_cleanup();
+});
+
+test('requests: allowed actions for the student and for Registry', function () {
+    $p = 'personal';
+    assert_same(['pay', 'cancel'], Transcript::allowedActions(['status' => 'pending_payment', 'destination_type' => $p]));
+    assert_same(['retry', 'cancel'], Transcript::allowedActions(['status' => 'failed', 'destination_type' => $p]));
+    assert_same([], Transcript::allowedActions(['status' => 'payment_processing', 'destination_type' => $p]));
+    assert_same(['receipt'], Transcript::allowedActions(['status' => 'paid', 'destination_type' => $p]));
+    assert_same(['download', 'receipt'], Transcript::allowedActions(['status' => 'ready', 'destination_type' => $p]));
+    assert_same(['receipt'], Transcript::allowedActions(['status' => 'sent', 'destination_type' => 'institution']));
+    foreach (['cancelled', 'expired', 'rejected'] as $closed) {
+        assert_same([], Transcript::allowedActions(['status' => $closed, 'destination_type' => $p]), $closed);
+    }
+    assert_same(['start_processing', 'reject'], Transcript::adminActions(['status' => 'paid', 'destination_type' => $p]));
+    assert_same(['mark_ready', 'reject'], Transcript::adminActions(['status' => 'processing', 'destination_type' => $p]));
+    assert_same(['mark_sent', 'reject'], Transcript::adminActions(['status' => 'processing', 'destination_type' => 'institution']));
+    assert_same([], Transcript::adminActions(['status' => 'ready', 'destination_type' => $p]));
+    assert_same([], Transcript::adminActions(['status' => 'pending_payment', 'destination_type' => $p]));
+    assert_same(true, Transcript::canDownload(['status' => 'ready', 'destination_type' => $p]));
+    assert_same(false, Transcript::canDownload(['status' => 'sent', 'destination_type' => 'institution']));
+    assert_same(false, Transcript::canDownload(['status' => 'processing', 'destination_type' => $p]));
+});
+
+test('requests: findOwned returns only the student\'s own request', function () {
+    $row = Transcript::findOwned('tr_1001', 1);
+    assert_same('ready', $row['status']);
+    assert_same(1, (int) $row['student_id']);
+    assert_api_error('not_found', 404, fn () => Transcript::findOwned('tr_1001', 2));  // someone else's
+    assert_api_error('not_found', 404, fn () => Transcript::findOwned('tr_9999', 1));  // does not exist
+    assert_api_error('not_found', 404, fn () => Transcript::findOwned('garbage', 1));  // malformed
+});
+
+test('requests: expireOverdue expires unpaid requests and fails stale payments', function () {
+    b_requests_cleanup();
+    $past = gmdate('Y-m-d H:i:s', time() - 3600);
+    $future = gmdate('Y-m-d H:i:s', time() + 86400);
+    $overdue = b_make_request('pending_payment', ['student_id' => 7, 'expires_at' => $past]);
+    $stale = b_make_request('payment_processing', ['student_id' => 8, 'updated_at' => '2020-01-01 00:00:00']);
+    Database::execute("INSERT INTO payments (request_id, reference, amount, status) VALUES (?, ?, 5000, 'initiated')", [$stale, 'TMP-P' . bin2hex(random_bytes(6))]);
+    $fresh = b_make_request('pending_payment', ['student_id' => 5, 'expires_at' => $future]);
+
+    assert_true(Transcript::expireOverdue() >= 2, 'at least two rows changed');
+    assert_same('expired', b_status($overdue));
+    assert_same('failed', b_status($stale));
+    assert_same('pending_payment', b_status($fresh), 'not overdue, untouched');
+    $pay = Database::fetchOne('SELECT status FROM payments WHERE request_id = ?', [$stale]);
+    assert_same('failed', $pay['status'], 'the initiated payment is failed too');
+    b_requests_cleanup();
+
+    $failedPast = b_make_request('failed', ['student_id' => 7, 'expires_at' => $past]);
+    $processingNow = b_make_request('payment_processing', ['student_id' => 8]);
+    Transcript::expireOverdue();
+    assert_same('expired', b_status($failedPast), 'failed and overdue becomes expired');
+    assert_same('payment_processing', b_status($processingNow), 'recent payment_processing is left alone');
+    b_requests_cleanup();
+});
+
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
 
