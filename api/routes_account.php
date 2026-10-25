@@ -3,7 +3,9 @@
 $todo = function () { throw new RuntimeException('Not implemented'); };
 
 return [
-    'GET auth/csrf'                    => $todo,
+        'GET auth/csrf'                    => static function (): void {
+        Response::success(['csrfToken' => Csrf::token()]);
+    },
     'POST auth/login'                  => $todo,
     'GET auth/me'                      => $todo,
     'POST auth/logout'                 => $todo,

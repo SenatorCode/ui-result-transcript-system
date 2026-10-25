@@ -495,7 +495,95 @@ test('http: download streams a PDF for a ready personal copy and refuses others'
 });
 
 // ===== B: state machine, payment verify, password reset =====
-// Dev B: add your tests here with test('name', function () { ... });
+section('Security foundation (Dev B)');
+
+function b_cleanup(): void
+{
+    Database::execute("DELETE FROM login_attempts WHERE identifier LIKE 'TEST/%' OR identifier LIKE 'ADMIN:TEST%'");
+    Database::execute("DELETE FROM idempotency_keys WHERE idem_key LIKE 'test-%'");
+}
+
+test('security: rate limiter blocks the 6th failure with 429 and retryAfterSeconds', function () {
+    b_cleanup();
+    for ($i = 0; $i < 5; $i++) {
+        RateLimiter::assertAllowed('login', 'test/rl/001');
+        RateLimiter::recordFailure('login', 'test/rl/001');
+    }
+    try {
+        RateLimiter::assertAllowed('login', 'test/rl/001');
+        throw new AssertionError('expected 429');
+    } catch (ApiException $e) {
+        assert_same('rate_limited', $e->errorCode());
+        assert_same(429, $e->httpStatus());
+        assert_true($e->fields()['retryAfterSeconds'] > 0, 'retryAfterSeconds is set');
+    }
+    RateLimiter::assertAllowed('login', 'test/rl/002');        // another identifier is unaffected
+    RateLimiter::assertAllowed('admin', 'test/rl/001');        // admin counter is separate
+    RateLimiter::clear('login', 'test/rl/001');
+    RateLimiter::assertAllowed('login', 'test/rl/001');        // cleared after a good login
+    b_cleanup();
+});
+
+test('security: guards accept only real, active accounts', function () {
+    $_SESSION = [];
+    assert_api_error('session_expired', 401, fn () => Auth::requireStudent());
+    assert_api_error('session_expired', 401, fn () => Auth::requireAdmin());
+    $_SESSION = ['student_id' => 1];
+    assert_same(1, Auth::requireStudent());
+    assert_api_error('session_expired', 401, fn () => Auth::requireAdmin()); // student session is not admin
+    $_SESSION = ['student_id' => 8];                                         // CSC/2024/003 is suspended
+    assert_api_error('session_expired', 401, fn () => Auth::requireStudent());
+    $_SESSION = ['admin_id' => 1];
+    assert_same(1, Auth::requireAdmin());
+    assert_api_error('session_expired', 401, fn () => Auth::requireStudent());
+    $_SESSION = ['student_id' => 99999];
+    assert_api_error('session_expired', 401, fn () => Auth::requireStudent());
+    $_SESSION = [];
+});
+
+test('security: idempotency replays, detects conflicts and releases a failed claim', function () {
+    b_cleanup();
+    $_SESSION = ['student_id' => 1];
+    $calls = 0;
+    $fn = function () use (&$calls) { $calls++; return ['id' => 'tr_9999', 'run' => $calls]; };
+    $first = Idempotency::run('transcripts/create', 'test-key-1', ['copies' => 1, 'a' => 'x'], $fn);
+    $again = Idempotency::run('transcripts/create', 'test-key-1', ['a' => 'x', 'copies' => 1], $fn);
+    assert_same($first, $again, 'replay returns the stored result');
+    assert_same(1, $calls, 'function ran once');
+    assert_api_error('idempotency_conflict', 409, fn () => Idempotency::run('transcripts/create', 'test-key-1', ['copies' => 2], $fn));
+    assert_api_error('validation_failed', 422, fn () => Idempotency::run('transcripts/create', null, [], $fn));
+    assert_api_error('duplicate_open_request', 409, fn () => Idempotency::run('transcripts/create', 'test-key-2', [], function () {
+        throw new ApiException('duplicate_open_request', 'x', 409);
+    }));
+    Idempotency::run('transcripts/create', 'test-key-2', [], $fn); // key was released, so this runs
+    assert_same(2, $calls);
+    $_SESSION = [];
+    b_cleanup();
+});
+
+test('http: auth/csrf sets a safe session cookie and a stable token', function () {
+    $http = new Http(api_base());
+    $a = $http->request('GET', 'auth/csrf.php');
+    assert_same(200, $a['status']);
+    $token = $a['json']['data']['csrfToken'] ?? '';
+    assert_true(preg_match('/^[a-f0-9]{64}$/', $token) === 1, 'token is 64 hex characters');
+    $cookie = $a['headers']['set-cookie'] ?? '';
+    assert_true(str_contains($cookie, 'UISTUSESS'), 'student cookie name');
+    assert_true(stripos($cookie, 'HttpOnly') !== false, 'HttpOnly');
+    assert_true(stripos($cookie, 'SameSite=Lax') !== false, 'SameSite=Lax');
+    assert_true(str_contains($a['headers']['cache-control'] ?? '', 'no-store'), 'no-store');
+    $b = $http->request('GET', 'auth/csrf.php');
+    assert_same($token, $b['json']['data']['csrfToken'], 'same session, same token');
+    $other = (new Http(api_base()))->request('GET', 'auth/csrf.php');
+    assert_true($other['json']['data']['csrfToken'] !== $token, 'new session, new token');
+});
+
+test('http: admin URLs use their own cookie', function () {
+    $r = (new Http(api_base()))->request('GET', 'admin/auth/csrf.php'); // 501 until Dev C ships it; cookie is set either way
+    $cookie = $r['headers']['set-cookie'] ?? '';
+    assert_true(str_contains($cookie, 'UIADMINSESS'), 'admin cookie name');
+    assert_true(!str_contains($cookie, 'UISTUSESS'), 'not the student cookie');
+});
 
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
