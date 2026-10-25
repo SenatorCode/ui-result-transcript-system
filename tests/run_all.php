@@ -585,6 +585,124 @@ test('http: admin URLs use their own cookie', function () {
     assert_true(!str_contains($cookie, 'UISTUSESS'), 'not the student cookie');
 });
 
+section('Student login (Dev B)');
+
+function b_login_cleanup(): void
+{
+    Database::execute("DELETE FROM login_attempts WHERE identifier LIKE 'CSC/%' OR identifier LIKE 'NOPE/%'");
+}
+
+/** A client that already holds a pre-login CSRF token. */
+function b_client(): Http
+{
+    $http = new Http(api_base());
+    $r = $http->request('GET', 'auth/csrf.php');
+    if ($r['status'] !== 200) {
+        skip('auth/csrf.php not available');
+    }
+    $http->csrf = $r['json']['data']['csrfToken'];
+    return $http;
+}
+
+function b_error(array $r): ?string
+{
+    return $r['json']['error']['code'] ?? null;
+}
+
+test('login: POST without a CSRF token is refused', function () {
+    $r = (new Http(api_base()))->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/001', 'password' => 'Test@1234']);
+    assert_same(403, $r['status']);
+    assert_same('csrf_invalid', b_error($r));
+});
+
+test('login: missing fields give 422 with field messages', function () {
+    $r = b_client()->request('POST', 'auth/login.php', []);
+    assert_same(422, $r['status']);
+    assert_true(isset($r['json']['error']['fields']['matricNo']), 'matricNo message');
+    assert_true(isset($r['json']['error']['fields']['password']), 'password message');
+});
+
+test('login: wrong password and unknown matric look identical', function () {
+    b_login_cleanup();
+    $http = b_client();
+    $wrong = $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/001', 'password' => 'nope']);
+    $unknown = $http->request('POST', 'auth/login.php', ['matricNo' => 'NOPE/0000/000', 'password' => 'nope']);
+    assert_same(401, $wrong['status']);
+    assert_same(401, $unknown['status']);
+    assert_same('invalid_credentials', b_error($wrong));
+    assert_same($wrong['json']['error']['message'], $unknown['json']['error']['message']);
+    b_login_cleanup();
+});
+
+test('login: suspended account is 403 only with the right password', function () {
+    b_login_cleanup();
+    $http = b_client();
+    $good = $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2024/003', 'password' => 'Test@1234']);
+    assert_same(403, $good['status']);
+    assert_same('account_suspended', b_error($good));
+    $bad = $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2024/003', 'password' => 'wrong']);
+    assert_same(401, $bad['status']);
+    b_login_cleanup();
+});
+
+test('login: full flow (login, me, bad CSRF on logout, logout, me again)', function () {
+    b_login_cleanup();
+    $http = b_client();
+    $before = $http->csrf;
+    $login = $http->request('POST', 'auth/login.php', ['matricNo' => 'csc/2023/001', 'password' => 'Test@1234']); // lowercase on purpose
+    assert_same(200, $login['status']);
+    $data = $login['json']['data'];
+    assert_same('st_01', $data['student']['id']);
+    assert_same('CSC/2023/001', $data['student']['matricNo']);
+    assert_true(!array_key_exists('password_hash', $data['student']), 'no hash in the response');
+    assert_true($data['csrfToken'] !== $before, 'CSRF token rotated on login');
+    $http->csrf = $data['csrfToken'];
+
+    $me = $http->request('GET', 'auth/me.php');
+    assert_same(200, $me['status']);
+    assert_same('CSC/2023/001', $me['json']['data']['student']['matricNo']);
+    assert_same($http->csrf, $me['json']['data']['csrfToken']);
+
+    $good = $http->csrf;
+    $http->csrf = 'bad-token';
+    assert_same(403, $http->request('POST', 'auth/logout.php', [])['status'], 'logout with a bad token');
+    $http->csrf = $good;
+    $out = $http->request('POST', 'auth/logout.php', []);
+    assert_same(200, $out['status']);
+    assert_same(true, $out['json']['data']['loggedOut']);
+
+    $after = $http->request('GET', 'auth/me.php');
+    assert_same(401, $after['status']);
+    assert_same('session_expired', b_error($after));
+    b_login_cleanup();
+});
+
+test('login: 6th attempt is 429 with Retry-After, even with the right password', function () {
+    b_login_cleanup();
+    $http = b_client();
+    for ($i = 0; $i < 5; $i++) {
+        assert_same(401, $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/003', 'password' => 'wrong'])['status']);
+    }
+    $r = $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/003', 'password' => 'Test@1234']);
+    assert_same(429, $r['status']);
+    assert_same('rate_limited', b_error($r));
+    assert_true(($r['json']['error']['fields']['retryAfterSeconds'] ?? 0) > 0, 'retryAfterSeconds');
+    assert_true(isset($r['headers']['retry-after']), 'Retry-After header');
+    b_login_cleanup();
+});
+
+test('login: a successful login clears earlier failures', function () {
+    b_login_cleanup();
+    $http = b_client();
+    for ($i = 0; $i < 3; $i++) {
+        $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/002', 'password' => 'wrong']);
+    }
+    assert_same(200, $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2023/002', 'password' => 'Test@1234'])['status']);
+    $row = Database::fetchOne("SELECT COUNT(*) AS c FROM login_attempts WHERE identifier = 'CSC/2023/002'");
+    assert_same(0, (int) $row['c']);
+    b_login_cleanup();
+});
+
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
 
