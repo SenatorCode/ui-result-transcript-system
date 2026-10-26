@@ -732,8 +732,9 @@ function b_issue(): array
 
 function b_requests_cleanup(): void
 {
-    Database::execute("DELETE FROM payments WHERE request_id IN (SELECT id FROM transcript_requests WHERE request_no LIKE 'TMP-T%')");
-    Database::execute("DELETE FROM transcript_requests WHERE request_no LIKE 'TMP-T%'");
+    $where = "request_no LIKE 'TMP-T%' OR (student_id IN (5, 7, 8) AND id > 11)";
+    Database::execute("DELETE FROM payments WHERE request_id IN (SELECT id FROM transcript_requests WHERE $where)");
+    Database::execute("DELETE FROM transcript_requests WHERE $where");
 }
 
 function b_status(int $id): string
@@ -853,6 +854,357 @@ test('requests: expireOverdue expires unpaid requests and fails stale payments',
     assert_same('expired', b_status($failedPast), 'failed and overdue becomes expired');
     assert_same('payment_processing', b_status($processingNow), 'recent payment_processing is left alone');
     b_requests_cleanup();
+});
+
+section('Transcript requests (Dev B)');
+
+function b_session(string $matric): Http
+{
+    $http = b_client();
+    $login = $http->request('POST', 'auth/login.php', ['matricNo' => $matric, 'password' => 'Test@1234']);
+    assert_same(200, $login['status'], "login $matric");
+    $http->csrf = $login['json']['data']['csrfToken'];
+    return $http;
+}
+
+function b_key(): string
+{
+    return 'test-' . bin2hex(random_bytes(6));
+}
+
+/** Removes what the create tests made for student 7 (seed requests for 7 are ids 9 and 10). */
+function b_create_cleanup(): void
+{
+    Database::execute('DELETE FROM payments WHERE request_id IN (SELECT id FROM transcript_requests WHERE student_id = 7 AND id > 11)');
+    Database::execute('DELETE FROM transcript_requests WHERE student_id = 7 AND id > 11');
+    Database::execute('DELETE FROM idempotency_keys WHERE student_id IN (1, 7)');
+}
+
+function b_quote(Http $http, string $qs): array
+{
+    $r = $http->request('GET', 'transcripts/quote.php?' . $qs);
+    assert_same(200, $r['status'], 'quote');
+    return $r['json']['data'];
+}
+
+test('fees: option validation and the fee formula', function () {
+    $fee = (int) Config::get('TRANSCRIPT_FEE');
+    $courier = (int) Config::get('COURIER_SURCHARGE');
+    assert_same($fee, FeeCalculator::fee('download', 1));
+    assert_same($fee * 3, FeeCalculator::fee('email', 3));
+    assert_same($fee * 2 + $courier, FeeCalculator::fee('courier', 2));
+
+    $ok = FeeCalculator::options(['destinationType' => 'personal', 'copies' => '2']);
+    assert_same('download', $ok['deliveryMethod'], 'personal defaults to download');
+    assert_same(2, $ok['copies']);
+
+    $bad = [
+        [['destinationType' => 'nope'], false, 'destinationType'],
+        [['destinationType' => 'institution', 'deliveryMethod' => 'download'], false, 'deliveryMethod'],
+        [['destinationType' => 'personal', 'deliveryMethod' => 'courier'], false, 'deliveryMethod'],
+        [['destinationType' => 'personal', 'copies' => 4], false, 'copies'],
+        [['destinationType' => 'personal', 'copies' => 'abc'], false, 'copies'],
+        [['destinationType' => 'institution', 'deliveryMethod' => 'email'], true, 'institutionName'],
+        [['destinationType' => 'institution', 'deliveryMethod' => 'email', 'institutionName' => 'X'], true, 'destinationEmail'],
+        [['destinationType' => 'institution', 'deliveryMethod' => 'courier', 'institutionName' => 'X'], true, 'destinationAddress'],
+    ];
+    foreach ($bad as [$input, $full, $field]) {
+        try {
+            FeeCalculator::options($input, $full);
+            throw new AssertionError("expected 422 for $field");
+        } catch (ApiException $e) {
+            assert_same(422, $e->httpStatus());
+            assert_true(isset($e->fields()[$field]), "field message for $field");
+        }
+    }
+});
+
+test('quote: needs login, prices the options, rejects bad combinations', function () {
+    assert_same(401, (new Http(api_base()))->request('GET', 'transcripts/quote.php?destinationType=personal')['status']);
+    $http = b_session('CSC/2025/002');
+    $fee = (int) Config::get('TRANSCRIPT_FEE');
+    $p = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    assert_same($fee, $p['feeAmount']);
+    assert_same((string) Config::get('CURRENCY'), $p['currency']);
+    assert_true(strtotime($p['expiresAt']) > time(), 'expires in the future');
+    $c = b_quote($http, 'destinationType=institution&deliveryMethod=courier&copies=2');
+    assert_same($fee * 2 + (int) Config::get('COURIER_SURCHARGE'), $c['feeAmount']);
+    $bad = $http->request('GET', 'transcripts/quote.php?destinationType=institution&deliveryMethod=download&copies=1');
+    assert_same(422, $bad['status']);
+    assert_true(isset($bad['json']['error']['fields']['deliveryMethod']), 'deliveryMethod message');
+    $bad = $http->request('GET', 'transcripts/quote.php?destinationType=personal&copies=4');
+    assert_same(422, $bad['status']);
+    assert_true(isset($bad['json']['error']['fields']['copies']), 'copies message');
+});
+
+test('create: full flow (quote, create, replay, duplicate, ownership, cancel, create again)', function () {
+    b_create_cleanup();
+    $http = b_session('CSC/2025/002'); // student 7: no open request in the seed
+    $fee = (int) Config::get('TRANSCRIPT_FEE');
+    $quote = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $body = ['destinationType' => 'personal', 'deliveryMethod' => 'download', 'copies' => 1,
+             'quoteExpiresAt' => $quote['expiresAt'], 'feeAmount' => 1]; // the browser's fee is ignored
+
+    assert_same(422, $http->request('POST', 'transcripts/create.php', $body)['status'], 'Idempotency-Key is required');
+
+    $key = b_key();
+    $a = $http->request('POST', 'transcripts/create.php', $body, ['Idempotency-Key' => $key]);
+    assert_same(201, $a['status']);
+    $t = $a['json']['data']['transcript'];
+    assert_same('pending_payment', $t['status']);
+    assert_same($fee, $t['feeAmount'], 'fee computed on the server');
+    assert_same(['pay', 'cancel'], $t['allowedActions']);
+    $row = Database::fetchOne('SELECT request_no, expires_at FROM transcript_requests WHERE id = ?', [IdCodec::decode('tr', $t['id'])]);
+    assert_true(preg_match('/^TR-\d{4}-\d{6}$/', $row['request_no']) === 1, 'request number format');
+    assert_true($row['expires_at'] !== null, 'payment deadline set');
+
+    $replay = $http->request('POST', 'transcripts/create.php', $body, ['Idempotency-Key' => $key]);
+    assert_same(201, $replay['status']);
+    assert_same($t['id'], $replay['json']['data']['transcript']['id'], 'replay returns the same request');
+    $count = Database::fetchOne('SELECT COUNT(*) AS c FROM transcript_requests WHERE student_id = 7 AND id > 11');
+    assert_same(1, (int) $count['c'], 'replay made no second row');
+    $conflict = $http->request('POST', 'transcripts/create.php', ['copies' => 2] + $body, ['Idempotency-Key' => $key]);
+    assert_same(409, $conflict['status']);
+    assert_same('idempotency_conflict', $conflict['json']['error']['code'] ?? null);
+
+    $index = $http->request('GET', 'transcripts/index.php');
+    assert_same(200, $index['status']);
+    $ids = array_column($index['json']['data']['items'], 'id');
+    assert_true(in_array($t['id'], $ids, true), 'new request is listed');
+    assert_true(!in_array('tr_1001', $ids, true), "another student's request is not listed");
+
+    $quote2 = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $dup = $http->request('POST', 'transcripts/create.php', ['quoteExpiresAt' => $quote2['expiresAt']] + $body, ['Idempotency-Key' => b_key()]);
+    assert_same(409, $dup['status']);
+    assert_same('duplicate_open_request', $dup['json']['error']['code'] ?? null);
+
+    $other = b_session('CSC/2024/002'); // another student
+    assert_same(404, $other->request('POST', 'transcripts/cancel.php?id=' . $t['id'], [])['status'], 'cannot cancel a foreign request');
+
+    $cancel = $http->request('POST', 'transcripts/cancel.php?id=' . $t['id'], []);
+    assert_same(200, $cancel['status']);
+    assert_same('cancelled', $cancel['json']['data']['status']);
+    assert_same(409, $http->request('POST', 'transcripts/cancel.php?id=' . $t['id'], [])['status'], 'cancelling twice');
+    assert_same(422, $http->request('POST', 'transcripts/cancel.php', [])['status'], 'missing id');
+
+    $quote3 = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $again = $http->request('POST', 'transcripts/create.php', ['quoteExpiresAt' => $quote3['expiresAt']] + $body, ['Idempotency-Key' => b_key()]);
+    assert_same(201, $again['status'], 'a new request is allowed once the old one is cancelled');
+    b_create_cleanup();
+});
+
+test('create: quote and institution field checks', function () {
+    b_create_cleanup();
+    $http = b_session('CSC/2025/002');
+    $noQuote = $http->request('POST', 'transcripts/create.php', ['destinationType' => 'personal', 'deliveryMethod' => 'download', 'copies' => 1], ['Idempotency-Key' => b_key()]);
+    assert_same(422, $noQuote['status']);
+    assert_true(isset($noQuote['json']['error']['fields']['quoteExpiresAt']), 'quote required');
+
+    $q = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $mismatch = $http->request('POST', 'transcripts/create.php', ['destinationType' => 'personal', 'deliveryMethod' => 'download', 'copies' => 3, 'quoteExpiresAt' => $q['expiresAt']], ['Idempotency-Key' => b_key()]);
+    assert_same(422, $mismatch['status'], 'options must match the quote');
+
+    $cases = [
+        [['deliveryMethod' => 'email'], 'institutionName'],
+        [['institutionName' => 'Test University', 'deliveryMethod' => 'email'], 'destinationEmail'],
+        [['institutionName' => 'Test University', 'deliveryMethod' => 'courier'], 'destinationAddress'],
+        [['institutionName' => 'Test University', 'deliveryMethod' => 'email', 'destinationEmail' => 'not-an-email'], 'destinationEmail'],
+    ];
+    foreach ($cases as [$extra, $field]) {
+        $r = $http->request('POST', 'transcripts/create.php', ['destinationType' => 'institution', 'copies' => 1, 'quoteExpiresAt' => $q['expiresAt']] + $extra, ['Idempotency-Key' => b_key()]);
+        assert_same(422, $r['status'], $field);
+        assert_true(isset($r['json']['error']['fields'][$field]), "message for $field");
+    }
+    b_create_cleanup();
+});
+
+test('create: a student with an open request cannot make another', function () {
+    b_create_cleanup();
+    $http = b_session('CSC/2023/001'); // seed: tr_1002 is pending payment
+    $q = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $r = $http->request('POST', 'transcripts/create.php', ['destinationType' => 'personal', 'deliveryMethod' => 'download', 'copies' => 1, 'quoteExpiresAt' => $q['expiresAt']], ['Idempotency-Key' => b_key()]);
+    assert_same(409, $r['status']);
+    assert_same('duplicate_open_request', $r['json']['error']['code'] ?? null);
+    b_create_cleanup();
+});
+
+section('Payments (Dev B)');
+
+function b_future(): string
+{
+    return gmdate('Y-m-d H:i:s', time() + 86400);
+}
+
+function b_payment(string $reference): array
+{
+    return Database::fetchOne('SELECT * FROM payments WHERE reference = ?', [$reference]);
+}
+
+test('payments: initiate then settle marks the request paid; settling twice changes nothing', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    assert_same('payment_processing', $pay['status']);
+    assert_same('simulated', $pay['mode']);
+    assert_same(null, $pay['paymentUrl']);
+    assert_same(IdCodec::encode('tr', $id), $pay['transcriptId']);
+    assert_true(preg_match('/^PAY-\d{4}-[A-F0-9]{10}$/', $pay['reference']) === 1, 'reference format');
+    assert_same('payment_processing', b_status($id));
+
+    $first = Payment::settle($pay['reference']);
+    assert_same('success', $first['paymentStatus']);
+    assert_same('paid', $first['transcriptStatus']);
+    assert_same(['receipt'], $first['allowedActions']);
+    assert_same(true, $first['receiptAvailable']);
+    assert_true($first['verifiedAt'] !== null, 'verifiedAt set');
+    $row = b_payment($pay['reference']);
+    assert_true(preg_match('/^RCPT-\d{4}-\d+$/', (string) $row['receipt_no']) === 1, 'receipt number');
+    assert_true($row['gateway_txn_id'] !== null && $row['paid_at'] !== null, 'gateway id and paid time saved');
+
+    $second = Payment::settle($pay['reference']);
+    assert_same($first, $second, 'repeat gives the same answer');
+    assert_same($row['receipt_no'], b_payment($pay['reference'])['receipt_no'], 'receipt number unchanged');
+    $count = Database::fetchOne("SELECT COUNT(*) AS c FROM payments WHERE request_id = ? AND status = 'success'", [$id]);
+    assert_same(1, (int) $count['c'], 'exactly one successful payment');
+    assert_api_error('not_found', 404, fn () => Payment::settle('PAY-NOPE'));
+    b_requests_cleanup();
+});
+
+test('payments: only the owner can pay, and only from pending_payment or failed', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    assert_api_error('not_found', 404, fn () => Payment::initiate($id, 8));          // wrong owner
+    assert_same('pending_payment', b_status($id), 'wrong owner changed nothing');
+    Payment::initiate($id, 7);
+    assert_api_error('invalid_transition', 409, fn () => Payment::initiate($id, 7)); // already processing
+    foreach (['cancelled', 'expired'] as $closed) {
+        $c = b_make_request($closed, ['student_id' => 8]);
+        assert_api_error('invalid_transition', 409, fn () => Payment::initiate($c, 8));
+    }
+    b_requests_cleanup();
+});
+
+test('payments: a wrong amount is never marked paid, and the student can retry', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    Database::execute('UPDATE payments SET amount = 1 WHERE reference = ?', [$pay['reference']]); // tampered
+    $r = Payment::settle($pay['reference']);
+    assert_same('failed', $r['paymentStatus']);
+    assert_same('failed', $r['transcriptStatus']);
+    assert_same(['retry', 'cancel'], $r['allowedActions']);
+    $row = b_payment($pay['reference']);
+    assert_true(str_contains((string) $row['failure_reason'], 'amount'), 'reason mentions the amount');
+    assert_same(null, $row['receipt_no'], 'no receipt');
+
+    $retry = Payment::initiate($id, 7);
+    assert_true($retry['reference'] !== $pay['reference'], 'a new attempt has a new reference');
+    $ok = Payment::settle($retry['reference']);
+    assert_same('paid', $ok['transcriptStatus']);
+    $count = Database::fetchOne('SELECT COUNT(*) AS c FROM payments WHERE request_id = ?', [$id]);
+    assert_same(2, (int) $count['c'], 'both attempts are kept');
+    b_requests_cleanup();
+});
+
+test('payments: a declined payment fails the request', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    try {
+        Config::override(['SIMULATE_PAYMENT_FAILURE' => true]);
+        $r = Payment::settle($pay['reference']);
+    } finally {
+        Config::override(['SIMULATE_PAYMENT_FAILURE' => false]);
+    }
+    assert_same('failed', $r['paymentStatus']);
+    assert_same('failed', $r['transcriptStatus']);
+    assert_same('Card declined (simulated)', b_payment($pay['reference'])['failure_reason']);
+    b_requests_cleanup();
+});
+
+test('payments: simulated payments are refused when PAYMENT_MODE is not simulated', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    $original = Config::get('PAYMENT_MODE');
+    try {
+        Config::override(['PAYMENT_MODE' => 'paystack']);
+        assert_api_error('forbidden', 403, fn () => Payment::settle($pay['reference']));
+    } finally {
+        Config::override(['PAYMENT_MODE' => $original]);
+    }
+    assert_same('payment_processing', b_status($id), 'nothing changed');
+    assert_same('initiated', b_payment($pay['reference'])['status']);
+    b_requests_cleanup();
+});
+
+test('payments: markRefunded flags a verified payment once', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    Payment::settle($pay['reference']);
+    assert_same(true, Payment::markRefunded($id));
+    assert_same(false, Payment::markRefunded($id), 'second call flags nothing');
+    $row = b_payment($pay['reference']);
+    assert_same('success', $row['status'], 'status stays success');
+    assert_true($row['refunded_at'] !== null, 'refunded_at set');
+    $none = b_make_request('cancelled', ['student_id' => 8]);
+    assert_same(false, Payment::markRefunded($none), 'no payment to refund');
+    b_requests_cleanup();
+});
+
+test('payments: full flow over HTTP (create, pay, replay, verify twice, guards)', function () {
+    b_create_cleanup();
+    $http = b_session('CSC/2025/002');
+    $q = b_quote($http, 'destinationType=personal&deliveryMethod=download&copies=1');
+    $created = $http->request('POST', 'transcripts/create.php',
+        ['destinationType' => 'personal', 'deliveryMethod' => 'download', 'copies' => 1, 'quoteExpiresAt' => $q['expiresAt']],
+        ['Idempotency-Key' => b_key()]);
+    assert_same(201, $created['status']);
+    $tid = $created['json']['data']['transcript']['id'];
+    $payUrl = "transcripts/pay.php?id=$tid";
+    $verifyUrl = "payments/verify.php?id=$tid";
+
+    assert_same(403, (new Http(api_base()))->request('POST', $payUrl, [])['status'], 'no CSRF token');
+    assert_same(422, $http->request('POST', $payUrl, [])['status'], 'Idempotency-Key required');
+
+    $key = b_key();
+    $pay = $http->request('POST', $payUrl, [], ['Idempotency-Key' => $key]);
+    assert_same(200, $pay['status']);
+    $ref = $pay['json']['data']['reference'];
+    assert_same('payment_processing', $pay['json']['data']['status']);
+    assert_same('simulated', $pay['json']['data']['mode']);
+    $replay = $http->request('POST', $payUrl, [], ['Idempotency-Key' => $key]);
+    assert_same($ref, $replay['json']['data']['reference'], 'replay returns the same payment');
+    assert_same(409, $http->request('POST', $payUrl, [], ['Idempotency-Key' => b_key()])['status'], 'already processing');
+
+    $other = b_session('CSC/2024/002');
+    assert_same(404, $other->request('POST', $payUrl, [], ['Idempotency-Key' => b_key()])['status'], 'foreign request: pay');
+    assert_same(404, $other->request('POST', $verifyUrl, ['reference' => $ref])['status'], 'foreign request: verify');
+
+    assert_same(422, $http->request('POST', $verifyUrl, [])['status'], 'reference missing');
+    assert_same(422, $http->request('POST', $verifyUrl, ['reference' => 'PAY-NOPE'])['status'], 'reference unknown');
+    $seedRef = 'PAY-2026-000001'; // belongs to another request
+    assert_same(422, $http->request('POST', $verifyUrl, ['reference' => $seedRef])['status'], "someone else's reference");
+
+    $v = $http->request('POST', $verifyUrl, ['reference' => $ref]);
+    assert_same(200, $v['status']);
+    $d = $v['json']['data'];
+    assert_same('success', $d['paymentStatus']);
+    assert_same('paid', $d['transcriptStatus']);
+    assert_same(['receipt'], $d['allowedActions']);
+    assert_same(true, $d['receiptAvailable']);
+    assert_same($d, $http->request('POST', $verifyUrl, ['reference' => $ref])['json']['data'], 'verify is repeatable');
+
+    $item = null;
+    foreach ($http->request('GET', 'transcripts/index.php')['json']['data']['items'] as $i) {
+        if ($i['id'] === $tid) { $item = $i; }
+    }
+    assert_same('paid', $item['status']);
+    assert_same('success', $item['payment']['status']);
+    assert_same($ref, $item['payment']['reference']);
+    assert_same(409, $http->request('POST', $payUrl, [], ['Idempotency-Key' => b_key()])['status'], 'cannot pay twice');
+    b_create_cleanup();
 });
 
 // ===== C: admin flow =====

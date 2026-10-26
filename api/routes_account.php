@@ -52,11 +52,67 @@ return [
     },
     'POST auth/password-reset-request' => $todo,
     'POST auth/password-reset'         => $todo,
-    'GET transcripts/quote'           => $todo,
-    'POST transcripts/create'          => $todo,
-    'GET transcripts/index'            => $todo,
-    'POST transcripts/cancel'          => $todo,
-    'POST transcripts/pay'             => $todo,
-    'POST payments/verify'             => $todo,
+        'GET transcripts/quote' => static function (): void {
+        $studentId = Auth::requireStudent();
+        $query = [];
+        foreach (['destinationType', 'deliveryMethod', 'copies'] as $key) {
+            $query[$key] = Request::query($key);
+        }
+        Response::success(FeeCalculator::quote($studentId, $query));
+    },
+
+    'POST transcripts/create' => static function (): void {
+        Csrf::verify();
+        $studentId = Auth::requireStudent();
+        $body = Request::json();
+        $result = Idempotency::run(
+            'transcripts/create',
+            Request::header('Idempotency-Key'),
+            $body,
+            static fn (): array => ['transcript' => Transcript::create($studentId, $body)]
+        );
+        Response::success($result, 201);
+    },
+
+    'GET transcripts/index' => static function (): void {
+        $studentId = Auth::requireStudent();
+        Response::success(['items' => Transcript::listForStudent($studentId)]);
+    },
+
+    'POST transcripts/cancel' => static function (): void {
+        Csrf::verify();
+        $studentId = Auth::requireStudent();
+        Request::transcriptId(); // 422 when missing, 404 when malformed
+        Response::success(Transcript::cancel((string) Request::query('id'), $studentId));
+    },
+        'POST transcripts/pay' => static function (): void {
+        Csrf::verify();
+        $studentId = Auth::requireStudent();
+        $requestId = Request::transcriptId();                 // 422 missing, 404 malformed
+        $publicId = (string) Request::query('id');
+        Transcript::findOwned($publicId, $studentId);         // 404 for a foreign id
+        $result = Idempotency::run(
+            'transcripts/pay:' . $publicId,
+            Request::header('Idempotency-Key'),
+            Request::json(),
+            static fn (): array => Payment::initiate($requestId, $studentId)
+        );
+        Response::success($result);
+    },
+
+    'POST payments/verify' => static function (): void {
+        Csrf::verify();
+        $studentId = Auth::requireStudent();
+        Request::transcriptId();
+        $request = Transcript::findOwned((string) Request::query('id'), $studentId);
+        $body = Request::json();
+        Request::requireFields($body, ['reference' => 'Enter the payment reference.']);
+        $payment = is_string($body['reference']) ? Payment::findByReference(trim($body['reference'])) : null;
+        if ($payment === null || (int) $payment['request_id'] !== (int) $request['id']) {
+            throw new ApiException('validation_failed', 'The payment reference does not match this request.', 422,
+                ['reference' => 'Check the payment reference and try again.']);
+        }
+        Response::success(Payment::settle($payment['reference']));
+    },
     'GET payments/receipt'             => $todo,
 ];
