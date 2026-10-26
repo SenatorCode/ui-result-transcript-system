@@ -1426,6 +1426,111 @@ test('reset: full flow over HTTP, then only the new password works', function ()
     }
 });
 
+section('Security pass (Dev B)');
+
+/** Paths (without .php) of the student routes with this HTTP method, read from the routes files. */
+function b_route_paths(string $method): array
+{
+    $paths = [];
+    foreach (['routes_student.php', 'routes_account.php'] as $file) {
+        foreach (array_keys(require Config::root() . '/api/' . $file) as $key) {
+            if (str_starts_with($key, $method . ' ')) {
+                $paths[] = substr($key, strlen($method) + 1);
+            }
+        }
+    }
+    return $paths;
+}
+
+test('security pass: every student POST route refuses a logged-in request without a CSRF token', function () {
+    $paths = b_route_paths('POST');
+    assert_true(count($paths) >= 8, 'found the POST routes');
+    $http = b_session('CSC/2025/002');
+    $http->csrf = null; // keep the session cookie, drop the token
+    foreach ($paths as $path) {
+        $r = $http->request('POST', $path . '.php?id=tr_1001', []);
+        assert_same(403, $r['status'], "POST $path without a CSRF token");
+        assert_same('csrf_invalid', $r['json']['error']['code'] ?? null, $path);
+    }
+    Database::execute('DELETE FROM login_attempts');
+});
+
+test('security pass: every student GET route except auth/csrf answers 401 when logged out', function () {
+    $http = new Http(api_base());
+    foreach (b_route_paths('GET') as $path) {
+        if ($path === 'auth/csrf') {
+            continue;
+        }
+        $r = $http->request('GET', $path . '.php?id=tr_1001');
+        // A 200 here usually means DEV_STUDENT_ID is still set in your config.php. Remove it.
+        assert_same(401, $r['status'], "GET $path logged out");
+    }
+});
+
+test('security pass: API answers carry no-store and nosniff, errors included', function () {
+    $http = new Http(api_base());
+    foreach (['auth/csrf.php', 'auth/me.php', 'transcripts/index.php', 'does/not-exist.php'] as $path) {
+        $r = $http->request('GET', $path);
+        assert_true(str_contains($r['headers']['cache-control'] ?? '', 'no-store'), "$path: no-store");
+        assert_same('nosniff', $r['headers']['x-content-type-options'] ?? null, $path);
+    }
+});
+
+test('security pass: hostile input gets clean errors with no SQL or file paths', function () {
+    try {
+        $http = b_client();
+        $inputs = ["' OR '1'='1", "CSC/2023/001' --", '"; DROP TABLE students; --', str_repeat('A', 5000), "\0"];
+        foreach ($inputs as $input) {
+            $r = $http->request('POST', 'auth/login.php', ['matricNo' => $input, 'password' => 'x']);
+            assert_true(in_array($r['status'], [401, 422, 429], true), 'status was ' . $r['status']);
+            assert_true(preg_match('/SQLSTATE|PDO|\.php|xampp|[A-Z]:\\\\/i', $r['body']) !== 1, 'no internals in the body');
+        }
+        $students = Database::fetchOne('SELECT COUNT(*) AS c FROM students');
+        assert_true((int) $students['c'] >= 8, 'students table is intact');
+    } finally {
+        Database::execute('DELETE FROM login_attempts');
+    }
+});
+
+test('security pass: login issues a new session id (no session fixation)', function () {
+    try {
+        $http = new Http(api_base());
+        $before = $http->request('GET', 'auth/csrf.php');
+        $http->csrf = $before['json']['data']['csrfToken'];
+        $login = $http->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2025/002', 'password' => 'Test@1234']);
+        assert_same(200, $login['status']);
+        preg_match('/UISTUSESS=([^;]+)/', $before['headers']['set-cookie'] ?? '', $a);
+        preg_match('/UISTUSESS=([^;]+)/', $login['headers']['set-cookie'] ?? '', $b);
+        assert_true(isset($a[1], $b[1]) && $a[1] !== $b[1], 'the session id changed on login');
+    } finally {
+        Database::execute('DELETE FROM login_attempts');
+    }
+});
+
+test('security pass: logs hold no passwords', function () {
+    foreach (['error.log', 'php-errors.log'] as $name) {
+        $file = Config::root() . '/storage/logs/' . $name;
+        if (!is_file($file)) {
+            continue;
+        }
+        $text = (string) file_get_contents($file);
+        foreach (['Test@1234', 'Admin@1234', 'NewPass123', 'Another123', 'Strong1234', 'Reset12345'] as $secret) {
+            assert_true(!str_contains($text, $secret), "$secret found in $name");
+        }
+    }
+});
+
+test('security pass: a student session is refused on admin endpoints', function () {
+    $http = b_session('CSC/2025/002');
+    $r = $http->request('GET', 'admin/dashboard.php');
+    if ($r['status'] === 501) {
+        skip("admin endpoints not built yet (Dev C)");
+    }
+    assert_same(401, $r['status'], 'admin dashboard');
+    assert_same(401, $http->request('GET', 'admin/auth/me.php')['status'], 'admin me');
+    Database::execute('DELETE FROM login_attempts');
+});
+
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
 
