@@ -114,5 +114,23 @@ return [
         }
         Response::success(Payment::settle($payment['reference']));
     },
-    'GET payments/receipt'             => $todo,
+        
+        'GET payments/receipt' => static function (): void {
+        $studentId = Auth::requireStudent();
+        Request::transcriptId();                                   // 422 missing, 404 malformed
+        $request = Transcript::findOwned((string) Request::query('id'), $studentId); // 404 foreign
+        $receipt = Payment::receiptData((int) $request['id'], $studentId);
+        if ($receipt === null) {
+            throw new ApiException('not_found', 'A verified receipt is not available.', 404);
+        }
+        if (Request::acceptsPdf()) {
+            Response::pdf(ReceiptPdf::render($receipt), 'receipt-' . $receipt['receiptNumber'] . '.pdf');
+        }
+        Response::success([
+            'receiptNumber' => $receipt['receiptNumber'],
+            'amount'        => $receipt['amount'],
+            'paidAt'        => $receipt['paidAt'],
+            'reference'     => $receipt['reference'],
+        ]);
+    },
 ];

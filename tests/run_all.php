@@ -1207,6 +1207,59 @@ test('payments: full flow over HTTP (create, pay, replay, verify twice, guards)'
     b_create_cleanup();
 });
 
+section('Receipts (Dev B)');
+
+test('receipt: data for a verified seed payment, and null when there is nothing to show', function () {
+    $r = Payment::receiptData(1, 1); // TR-2026-000001, student 1
+    assert_same('RCPT-2026-1001', $r['receiptNumber']);
+    assert_same(5000, $r['amount']);
+    assert_same('NGN', $r['currency']);
+    assert_same('2026-09-02T10:15:00Z', $r['paidAt']);
+    assert_same('PAY-2026-000001', $r['reference']);
+    assert_same('TR-2026-000001', $r['requestNo']);
+    assert_same('CSC/2023/001', $r['matricNo']);
+    assert_same('Personal copy', $r['destination']);
+    assert_same(1, $r['copies']);
+    assert_same('University of Ibadan', $r['university']);
+    assert_same(null, Payment::receiptData(1, 2), "another student's request");
+    assert_same(null, Payment::receiptData(2, 1), 'request with no payment');
+    assert_same(null, Payment::receiptData(99999, 1), 'unknown request');
+    assert_same('%PDF-', substr(ReceiptPdf::render($r), 0, 5), 'renders with the PDF code');
+});
+
+test('receipt: a refunded payment has no receipt', function () {
+    b_requests_cleanup();
+    $id = b_make_request('pending_payment', ['expires_at' => b_future()]);
+    $pay = Payment::initiate($id, 7);
+    Payment::settle($pay['reference']);
+    assert_true(Payment::receiptData($id, 7) !== null, 'receipt exists after verification');
+    Payment::markRefunded($id);
+    assert_same(null, Payment::receiptData($id, 7));
+    b_requests_cleanup();
+});
+
+test('receipt: HTTP, JSON and PDF, owner only', function () {
+    assert_same(401, (new Http(api_base()))->request('GET', 'payments/receipt.php?id=tr_1001')['status'], 'logged out');
+    $http = b_session('CSC/2023/001');
+    $json = $http->request('GET', 'payments/receipt.php?id=tr_1001');
+    assert_same(200, $json['status']);
+    $d = $json['json']['data'];
+    assert_same('RCPT-2026-1001', $d['receiptNumber']);
+    assert_same(5000, $d['amount']);
+    assert_same('PAY-2026-000001', $d['reference']);
+    assert_same('2026-09-02T10:15:00Z', $d['paidAt']);
+
+    $pdf = $http->request('GET', 'payments/receipt.php?id=tr_1001', null, ['Accept' => 'application/pdf']);
+    assert_same(200, $pdf['status']);
+    assert_same('application/pdf', $pdf['headers']['content-type'] ?? null);
+    assert_same('%PDF-', substr($pdf['body'], 0, 5));
+
+    assert_same(404, $http->request('GET', 'payments/receipt.php?id=tr_1002')['status'], 'no verified payment');
+    assert_same(404, $http->request('GET', 'payments/receipt.php?id=tr_1005')['status'], "someone else's request");
+    assert_same(404, $http->request('GET', 'payments/receipt.php?id=garbage')['status'], 'malformed id');
+    assert_same(422, $http->request('GET', 'payments/receipt.php')['status'], 'missing id');
+});
+
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
 

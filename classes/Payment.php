@@ -158,7 +158,40 @@ final class Payment
     }
 
     /** Feature 6. */
-    public static function receiptData(int $requestId, int $studentId): ?array { throw new RuntimeException('Not implemented'); }
+        /**
+     * Receipt for the student's own request, or null when there is no verified payment
+     * (or it was refunded). The array shape is what ReceiptPdf::render() expects.
+     */
+    public static function receiptData(int $requestId, int $studentId): ?array
+    {
+        $row = Database::fetchOne(
+            "SELECT p.receipt_no, p.amount, p.currency, p.paid_at, p.reference,
+                    tr.request_no, tr.destination_type, tr.institution_name, tr.copies,
+                    s.full_name, s.matric_no
+               FROM payments p
+               JOIN transcript_requests tr ON tr.id = p.request_id
+               JOIN students s ON s.id = tr.student_id
+              WHERE p.request_id = ? AND tr.student_id = ?
+                AND p.status = 'success' AND p.refunded_at IS NULL",
+            [$requestId, $studentId]
+        );
+        if ($row === null) {
+            return null;
+        }
+        return [
+            'receiptNumber' => $row['receipt_no'],
+            'amount'        => Response::naira($row['amount']),
+            'currency'      => $row['currency'],
+            'paidAt'        => Response::iso($row['paid_at']),
+            'reference'     => $row['reference'],
+            'requestNo'     => $row['request_no'],
+            'studentName'   => $row['full_name'],
+            'matricNo'      => $row['matric_no'],
+            'destination'   => $row['destination_type'] === 'personal' ? 'Personal copy' : $row['institution_name'],
+            'copies'        => (int) $row['copies'],
+            'university'    => (string) Config::get('UNIVERSITY_NAME'),
+        ];
+    }
 
     /** Flags the verified payment refunded (C's reject flow). True when a payment was flagged. */
     public static function markRefunded(int $requestId): bool
