@@ -46,8 +46,148 @@ final class Student
 
 final class PasswordReset
 {
-    /** Proposed. Same response for every input. */
-    public static function request(string $emailOrMatric): void { throw new RuntimeException('Not implemented'); }
-    /** Proposed. Single-use token. */
-    public static function consume(string $token, string $newPassword): void { throw new RuntimeException('Not implemented'); }
+    private const TOKEN_HOURS = 1;
+
+    /** At least 8 characters (72 max, the bcrypt limit), one letter and one number. */
+    public static function assertPasswordPolicy(string $password): void
+    {
+        $problem = null;
+        if (strlen($password) < 8) {
+            $problem = 'Use at least 8 characters.';
+        } elseif (strlen($password) > 72) {
+            $problem = 'Use 72 characters or fewer.';
+        } elseif (!preg_match('/[A-Za-z]/', $password) || !preg_match('/\d/', $password)) {
+            $problem = 'Use at least one letter and one number.';
+        }
+        if ($problem !== null) {
+            throw new ApiException('validation_failed', 'Check the highlighted fields and try again.', 422, ['newPassword' => $problem]);
+        }
+    }
+
+    /**
+     * Looks the student up by matric number or email and writes a reset link to the log file.
+     * Returns nothing and behaves the same for unknown or suspended accounts, so callers
+     * cannot tell whether an account exists.
+     */
+    public static function request(string $emailOrMatric): void
+    {
+        $identity = trim($emailOrMatric);
+        if ($identity === '') {
+            return;
+        }
+        $student = Database::fetchOne(
+            'SELECT id, matric_no, status FROM students WHERE matric_no = ? OR email = ? LIMIT 1',
+            [strtoupper($identity), $identity]
+        );
+        if ($student === null || $student['status'] === 'suspended') {
+            return;
+        }
+        self::writeLink((string) $student['matric_no'], self::issue((int) $student['id']));
+    }
+
+    /**
+     * Creates a one-hour token for the student (earlier unused tokens stop working) and
+     * returns the raw token. Only its SHA-256 hash is stored.
+     */
+    public static function issue(int $studentId): string
+    {
+        $token = bin2hex(random_bytes(32));
+        $expires = gmdate('Y-m-d H:i:s', time() + self::TOKEN_HOURS * 3600);
+        Database::transaction(function () use ($studentId, $token, $expires): void {
+            Database::execute(
+                'UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP() WHERE student_id = ? AND used_at IS NULL',
+                [$studentId]
+            );
+            Database::execute(
+                'INSERT INTO password_reset_tokens (student_id, token_hash, expires_at, ip_address) VALUES (?, ?, ?, ?)',
+                [$studentId, hash('sha256', $token), $expires, Request::ip()]
+            );
+        });
+        return $token;
+    }
+
+    /**
+     * Sets a new password with a valid, unused token. The password policy is checked first,
+     * so a weak password does not burn the token. The token is claimed with one conditional
+     * UPDATE, so it can only ever be used once.
+     */
+    public static function consume(string $token, string $newPassword): void
+    {
+        self::assertPasswordPolicy($newPassword);
+        $invalid = new ApiException(
+            'validation_failed',
+            'This reset link is invalid or has expired. Request a new one.',
+            422,
+            ['token' => 'Request a new reset link.']
+        );
+        $token = strtolower(trim($token));
+        if (preg_match('/^[a-f0-9]{64}$/', $token) !== 1) {
+            throw $invalid;
+        }
+        $hash = hash('sha256', $token);
+
+        Database::transaction(function () use ($hash, $newPassword, $invalid): void {
+            $claimed = Database::execute(
+                'UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP()
+                  WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()',
+                [$hash]
+            );
+            if ($claimed !== 1) {
+                throw $invalid;
+            }
+            $row = Database::fetchOne(
+                'SELECT t.student_id, s.matric_no FROM password_reset_tokens t
+                   JOIN students s ON s.id = t.student_id WHERE t.token_hash = ?',
+                [$hash]
+            );
+            Database::execute(
+                'UPDATE students SET password_hash = ? WHERE id = ?',
+                [password_hash($newPassword, PASSWORD_DEFAULT), (int) $row['student_id']]
+            );
+            Database::execute(
+                'UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP() WHERE student_id = ? AND used_at IS NULL',
+                [(int) $row['student_id']]
+            );
+            // A student locked out by failed logins can sign in straight away with the new password.
+            Database::execute(
+                "DELETE FROM login_attempts WHERE kind = 'login' AND identifier = ?",
+                [strtoupper((string) $row['matric_no'])]
+            );
+        });
+    }
+
+    /** Dev stand-in for email: one line per link in the reset log. */
+    private static function writeLink(string $matricNo, string $token): void
+    {
+        $path = (string) Config::get('RESET_LOG_PATH', 'storage/logs/reset-links.log');
+        if (!preg_match('#^([A-Za-z]:)?[\\\\/]#', $path)) {
+            $path = Config::root() . '/' . $path;
+        }
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $line = sprintf(
+            "[%s UTC] %s  %s/public/#/reset-password?token=%s  (valid %d hour)\n",
+            gmdate('Y-m-d H:i:s'), $matricNo, self::baseUrl(), $token, self::TOKEN_HOURS
+        );
+        @file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
+    }
+
+    /** Project URL without a trailing slash, e.g. http://localhost/ui-result-transcript-system. */
+    private static function baseUrl(): string
+    {
+        $configured = Config::get('APP_URL', null);
+        if (is_string($configured) && $configured !== '') {
+            return rtrim($configured, '/');
+        }
+        $https = !empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off';
+        $host = (string) ($_SERVER['HTTP_HOST'] ?? 'localhost');
+        if (preg_match('/^[A-Za-z0-9.\-:]+$/', $host) !== 1) {
+            $host = 'localhost';
+        }
+        $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+        $prefix = preg_match('#^(.*?)/api/#', $uri, $m) === 1 ? $m[1] : '';
+        return ($https ? 'https' : 'http') . '://' . $host . $prefix;
+    }
 }

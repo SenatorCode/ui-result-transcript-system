@@ -50,8 +50,45 @@ return [
         Session::destroy();
         Response::success(['loggedOut' => true]);
     },
-    'POST auth/password-reset-request' => $todo,
-    'POST auth/password-reset'         => $todo,
+
+        'POST auth/password-reset-request' => static function (): void {
+        Csrf::verify();
+        $body = Request::json();
+        Request::requireFields($body, ['emailOrMatric' => 'Enter your matric number or email.']);
+        if (!is_string($body['emailOrMatric']) || strlen(trim($body['emailOrMatric'])) > 120) {
+            throw new ApiException('validation_failed', 'Check the highlighted fields and try again.', 422,
+                ['emailOrMatric' => 'Enter your matric number or email.']);
+        }
+        $identity = trim($body['emailOrMatric']);
+        RateLimiter::assertAllowed('reset', $identity);   // 5 requests per 15 minutes per identifier and IP
+        RateLimiter::recordFailure('reset', $identity);   // every request counts, known or not
+        PasswordReset::request($identity);
+        Response::success(['message' => 'If the account can be found, reset instructions will be sent.']);
+    },
+
+    'POST auth/password-reset' => static function (): void {
+        Csrf::verify();
+        $body = Request::json();
+        Request::requireFields($body, [
+            'token'       => 'Use the link from your reset email.',
+            'newPassword' => 'Enter a new password.',
+        ]);
+        if (!is_string($body['token']) || !is_string($body['newPassword'])) {
+            throw new ApiException('validation_failed', 'Check the highlighted fields and try again.', 422);
+        }
+        RateLimiter::assertAllowed('reset', 'TOKEN-ATTEMPT'); // limits token guessing per IP
+        try {
+            PasswordReset::consume($body['token'], $body['newPassword']);
+        } catch (ApiException $e) {
+            if (isset($e->fields()['token'])) {               // only bad tokens count, not weak passwords
+                RateLimiter::recordFailure('reset', 'TOKEN-ATTEMPT');
+            }
+            throw $e;
+        }
+        RateLimiter::clear('reset', 'TOKEN-ATTEMPT');
+        Response::success(['reset' => true]);
+    },
+
         'GET transcripts/quote' => static function (): void {
         $studentId = Auth::requireStudent();
         $query = [];

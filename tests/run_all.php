@@ -1260,6 +1260,172 @@ test('receipt: HTTP, JSON and PDF, owner only', function () {
     assert_same(422, $http->request('GET', 'payments/receipt.php')['status'], 'missing id');
 });
 
+section('Password reset (Dev B)');
+
+function b_reset_hash(): string
+{
+    return (string) Database::fetchOne('SELECT password_hash FROM students WHERE id = 7')['password_hash'];
+}
+
+/** Puts student 7's password back and removes what the reset tests created. */
+function b_reset_restore(string $hash): void
+{
+    Database::execute('UPDATE students SET password_hash = ? WHERE id = 7', [$hash]);
+    Database::execute('DELETE FROM password_reset_tokens WHERE student_id = 7');
+    Database::execute("DELETE FROM login_attempts WHERE identifier IN ('TOKEN-ATTEMPT', 'CSC/2025/002') OR identifier LIKE 'TEST/%'");
+}
+
+test('reset: password policy', function () {
+    PasswordReset::assertPasswordPolicy('Valid1234'); // passes
+    foreach (['short1', 'abcdefghij', '1234567890', str_repeat('a1', 37)] as $bad) {
+        try {
+            PasswordReset::assertPasswordPolicy($bad);
+            throw new AssertionError("expected 422 for '$bad'");
+        } catch (ApiException $e) {
+            assert_same(422, $e->httpStatus());
+            assert_true(isset($e->fields()['newPassword']), 'newPassword message');
+        }
+    }
+});
+
+test('reset: tokens are hashed, single use, expire, and a newer token replaces an older one', function () {
+    $orig = b_reset_hash();
+    try {
+        $t = PasswordReset::issue(7);
+        assert_true(preg_match('/^[a-f0-9]{64}$/', $t) === 1, 'token is 64 hex characters');
+        $raw = Database::fetchOne('SELECT COUNT(*) AS c FROM password_reset_tokens WHERE token_hash = ?', [$t]);
+        assert_same(0, (int) $raw['c'], 'the raw token is never stored');
+        $hashed = Database::fetchOne('SELECT COUNT(*) AS c FROM password_reset_tokens WHERE token_hash = ?', [hash('sha256', $t)]);
+        assert_same(1, (int) $hashed['c'], 'its hash is');
+
+        PasswordReset::consume($t, 'NewPass123');
+        assert_true(password_verify('NewPass123', b_reset_hash()), 'password changed');
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume($t, 'Another123')); // single use
+        assert_true(password_verify('NewPass123', b_reset_hash()), 'the reused token changed nothing');
+
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume(str_repeat('a', 64), 'Another123')); // unknown
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume('nonsense', 'Another123'));
+
+        $old = PasswordReset::issue(7);
+        $new = PasswordReset::issue(7);
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume($old, 'Another123'), 'older token replaced');
+        PasswordReset::consume($new, 'Another123');
+
+        $expired = PasswordReset::issue(7);
+        Database::execute('UPDATE password_reset_tokens SET expires_at = ? WHERE token_hash = ?',
+            [gmdate('Y-m-d H:i:s', time() - 60), hash('sha256', $expired)]);
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume($expired, 'Another123'));
+    } finally {
+        b_reset_restore($orig);
+    }
+});
+
+test('reset: a weak password does not use up the token; a reset clears the login lockout', function () {
+    $orig = b_reset_hash();
+    try {
+        for ($i = 0; $i < 5; $i++) {
+            RateLimiter::recordFailure('login', 'CSC/2025/002');
+        }
+        $t = PasswordReset::issue(7);
+        assert_api_error('validation_failed', 422, fn () => PasswordReset::consume($t, 'weak'));
+        PasswordReset::consume($t, 'Strong1234'); // the same token still works
+        $left = Database::fetchOne("SELECT COUNT(*) AS c FROM login_attempts WHERE kind = 'login' AND identifier = 'CSC/2025/002'");
+        assert_same(0, (int) $left['c'], 'lockout cleared');
+    } finally {
+        b_reset_restore($orig);
+    }
+});
+
+test('reset: request writes a link for a known account and nothing for an unknown one', function () {
+    $orig = b_reset_hash();
+    $original = Config::get('RESET_LOG_PATH');
+    $log = Config::root() . '/storage/logs/reset-test.log';
+    @unlink($log);
+    try {
+        Config::override(['RESET_LOG_PATH' => 'storage/logs/reset-test.log']);
+        PasswordReset::request('NOPE/0000/000');
+        PasswordReset::request('   ');
+        assert_true(!is_file($log), 'unknown account: no link written');
+        $before = Database::fetchOne('SELECT COUNT(*) AS c FROM password_reset_tokens');
+
+        PasswordReset::request('csc/2025/002');                 // by matric number, any case
+        PasswordReset::request('kehinde.oladipo@example.com');  // by email (seed email for student 7 may differ; see note)
+        assert_true(is_file($log), 'known account: link written');
+        $text = (string) file_get_contents($log);
+        assert_true(str_contains($text, 'CSC/2025/002'), 'matric number in the log line');
+        assert_true(preg_match('/reset-password\?token=[a-f0-9]{64}/', $text) === 1, 'link with a token');
+
+        PasswordReset::request('CSC/2024/003'); // suspended: no token
+        $suspended = Database::fetchOne('SELECT COUNT(*) AS c FROM password_reset_tokens WHERE student_id = 8');
+        assert_same(0, (int) $suspended['c'], 'suspended account gets no token');
+    } finally {
+        Config::override(['RESET_LOG_PATH' => $original]);
+        @unlink($log);
+        b_reset_restore($orig);
+    }
+});
+
+test('reset: HTTP request endpoint answers the same for known and unknown accounts, and throttles', function () {
+    $orig = b_reset_hash();
+    $log = Config::root() . '/storage/logs/reset-links.log';
+    $size = is_file($log) ? filesize($log) : 0;
+    try {
+        $none = (new Http(api_base()))->request('POST', 'auth/password-reset-request.php', ['emailOrMatric' => 'x']);
+        assert_same(403, $none['status'], 'no CSRF token');
+
+        $http = b_client();
+        assert_same(422, $http->request('POST', 'auth/password-reset-request.php', [])['status'], 'missing field');
+        $known = $http->request('POST', 'auth/password-reset-request.php', ['emailOrMatric' => 'CSC/2025/002']);
+        $unknown = $http->request('POST', 'auth/password-reset-request.php', ['emailOrMatric' => 'TEST/RESET/001']);
+        assert_same(200, $known['status']);
+        assert_same(200, $unknown['status']);
+        assert_same($known['json'], $unknown['json'], 'identical body');
+        assert_same('If the account can be found, reset instructions will be sent.', $known['json']['data']['message']);
+        $tokens = Database::fetchOne('SELECT COUNT(*) AS c FROM password_reset_tokens WHERE student_id = 7');
+        assert_same(1, (int) $tokens['c'], 'the known account got a token');
+        clearstatcache();
+        assert_true(is_file($log) && filesize($log) > $size, 'a link line was appended to the reset log');
+
+        for ($i = 0; $i < 4; $i++) { // 5 requests allowed, so the 6th is blocked
+            assert_same(200, $http->request('POST', 'auth/password-reset-request.php', ['emailOrMatric' => 'TEST/RESET/001'])['status']);
+        }
+        $blocked = $http->request('POST', 'auth/password-reset-request.php', ['emailOrMatric' => 'TEST/RESET/001']);
+        assert_same(429, $blocked['status']);
+        assert_true(isset($blocked['headers']['retry-after']), 'Retry-After header');
+    } finally {
+        b_reset_restore($orig);
+    }
+});
+
+test('reset: full flow over HTTP, then only the new password works', function () {
+    $orig = b_reset_hash();
+    try {
+        $token = PasswordReset::issue(7);
+        $http = b_client();
+        assert_same(403, (new Http(api_base()))->request('POST', 'auth/password-reset.php', ['token' => $token, 'newPassword' => 'NewPass123'])['status'], 'no CSRF token');
+        assert_same(422, $http->request('POST', 'auth/password-reset.php', [])['status'], 'missing fields');
+
+        $weak = $http->request('POST', 'auth/password-reset.php', ['token' => $token, 'newPassword' => 'weak']);
+        assert_same(422, $weak['status']);
+        assert_true(isset($weak['json']['error']['fields']['newPassword']), 'newPassword message');
+
+        $ok = $http->request('POST', 'auth/password-reset.php', ['token' => $token, 'newPassword' => 'NewPass123']);
+        assert_same(200, $ok['status']);
+        assert_same(true, $ok['json']['data']['reset']);
+
+        $reuse = $http->request('POST', 'auth/password-reset.php', ['token' => $token, 'newPassword' => 'Another123']);
+        assert_same(422, $reuse['status']);
+        assert_true(isset($reuse['json']['error']['fields']['token']), 'token message');
+
+        $newLogin = b_client()->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2025/002', 'password' => 'NewPass123']);
+        assert_same(200, $newLogin['status'], 'new password works');
+        $oldLogin = b_client()->request('POST', 'auth/login.php', ['matricNo' => 'CSC/2025/002', 'password' => 'Test@1234']);
+        assert_same(401, $oldLogin['status'], 'old password no longer works');
+    } finally {
+        b_reset_restore($orig);
+    }
+});
+
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
 
