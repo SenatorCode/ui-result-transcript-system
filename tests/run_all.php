@@ -1533,6 +1533,95 @@ test('security pass: a student session is refused on admin endpoints', function 
 
 // ===== C: admin flow =====
 // Dev C: add your tests here with test('name', function () { ... });
+section('Admin flow (Dev C)');
+
+/** Helper to login as an Admin and return the HTTP client. */
+function c_admin_session(): Http {
+    $http = new Http(api_base());
+    $csrf = $http->request('GET', 'admin/auth/csrf.php');
+    if ($csrf['status'] !== 200) {
+        skip("admin auth/csrf.php not available");
+    }
+    $http->csrf = $csrf['json']['data']['csrfToken'];
+    
+    $login = $http->request('POST', 'admin/auth/login.php', ['username' => 'registry.admin', 'password' => 'Admin@1234']);
+    if ($login['status'] !== 200) {
+        throw new AssertionError("Admin login failed: " . $login['body']);
+    }
+    $http->csrf = $login['json']['data']['csrfToken'];
+    return $http;
+}
+
+/** Helper to find a seed request by status and return its encoded ID (e.g., tr_1001). */
+function c_get_request_id(string $status, string $dest = 'personal'): string {
+    $row = Database::fetchOne('SELECT id FROM transcript_requests WHERE status = ? AND destination_type = ? LIMIT 1', [$status, $dest]);
+    if (!$row) {
+        skip("no request with status '$status' and destination '$dest' found in seed data");
+    }
+    return IdCodec::encode('tr', (int)$row['id']);
+}
+
+test('admin: login requires valid credentials', function () {
+    $http = new Http(api_base());
+    $csrf = $http->request('GET', 'admin/auth/csrf.php');
+    if ($csrf['status'] !== 200) skip("admin auth/csrf not available");
+    $http->csrf = $csrf['json']['data']['csrfToken'];
+    
+    // Bad credentials
+    $bad = $http->request('POST', 'admin/auth/login.php', ['username' => 'wrong', 'password' => 'wrong']);
+    assert_same(401, $bad['status']);
+    
+    // Good credentials
+    $good = $http->request('POST', 'admin/auth/login.php', ['username' => 'registry.admin', 'password' => 'Admin@1234']);
+    assert_same(200, $good['status']);
+    assert_true(isset($good['json']['data']['admin']['id']));
+});
+
+test('admin: student session is refused on admin endpoints', function () {
+    // Uses b_session() from Dev B's tests
+    $http = b_session('CSC/2023/001');
+    $r = $http->request('GET', 'admin/dashboard.php');
+    assert_same(401, $r['status']);
+    assert_same('session_expired', $r['json']['error']['code'] ?? null);
+});
+
+test('admin: missing CSRF on update-status is refused', function () {
+    $http = c_admin_session();
+    $http->csrf = null; // Drop the CSRF token
+    $id = c_get_request_id('paid');
+    $r = $http->request('POST', "admin/transcripts/update-status.php?id=$id", ['action' => 'start_processing']);
+    assert_same(403, $r['status']);
+    assert_same('csrf_invalid', $r['json']['error']['code'] ?? null);
+});
+
+test('admin: start processing moves paid to processing', function () {
+    $http = c_admin_session();
+    $id = c_get_request_id('paid');
+    $r = $http->request('POST', "admin/transcripts/update-status.php?id=$id", ['action' => 'start_processing']);
+    assert_same(200, $r['status']);
+    assert_same('processing', $r['json']['data']['status']);
+});
+
+test('admin: reject with reason flags refund and moves to rejected', function () {
+    $http = c_admin_session();
+    $id = c_get_request_id('processing');
+    
+    $r = $http->request('POST', "admin/transcripts/update-status.php?id=$id", ['action' => 'reject', 'reason' => 'Test rejection reason']);
+    assert_same(200, $r['status']);
+    assert_same('rejected', $r['json']['data']['status']);
+    assert_same('Test rejection reason', $r['json']['data']['rejectionReason']);
+    assert_true($r['json']['data']['refundRequired']);
+});
+
+test('admin: illegal transition (mark_ready on institution copy)', function () {
+    $http = c_admin_session();
+    // Get a processing institution copy
+    $id = c_get_request_id('processing', 'institution');
+    
+    $r = $http->request('POST', "admin/transcripts/update-status.php?id=$id", ['action' => 'mark_ready']);
+    assert_same(409, $r['status']);
+    assert_same('invalid_transition', $r['json']['error']['code'] ?? null);
+});
 
 // ===================================================================================
 // Summary (Dev A)
