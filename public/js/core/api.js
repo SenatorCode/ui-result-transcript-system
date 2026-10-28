@@ -83,8 +83,9 @@ export async function api(path, options = {}) {
   const cached = cache.get(key);
   if (cached && Date.now() - cached.at < config.CACHE_TTL_MS) {
     if (!pending.has(key)) pending.set(key, request(path, options).then(data => {
+      const changed = JSON.stringify(data) !== JSON.stringify(cached.data);
       cache.set(key, { data, at: Date.now() });
-      window.dispatchEvent(new CustomEvent('api:refresh', { detail: { path } }));
+      if (changed) window.dispatchEvent(new CustomEvent('api:refresh', { detail: { path } }));
       return data;
     }).catch(() => cached.data).finally(() => pending.delete(key)));
     return cached.data;
