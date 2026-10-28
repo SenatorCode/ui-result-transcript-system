@@ -1,13 +1,11 @@
 <?php
-
-
 // Owner: Dev C. Aligned against classes/Admin.php and classes/Core.php parameters.
 declare(strict_types=1);
 
 $todo = function () { throw new RuntimeException('Not implemented'); };
  
 return [  
-    //  Auth //
+    // ---------- Auth ----------
     'GET admin/auth/csrf' => function () {
         Response::success(["csrfToken" => Csrf::token()]);
     },
@@ -68,13 +66,13 @@ return [
         Response::success(['loggedOut' => true]);
     },   
 
-    //  Dashboard //
+    // ---------- Dashboard ----------
     'GET admin/dashboard' => function() {
         Auth::requireAdmin(); 
         Response::success(AdminReport::dashboard());
     },
 
-    //  Transcript Requests //
+    // ---------- Transcript Requests ----------
     'GET admin/transcripts/index' => function () { 
         Auth::requireAdmin(); 
         $filters = [ 
@@ -127,7 +125,7 @@ return [
         Response::pdf($pdf['bytes'], 'Transcript_' . $requestNo . '.pdf');
     },
 
-    //  Payments //  
+    // ---------- Payments ----------  
     'GET admin/payments/index' => function () {
         Auth::requireAdmin();
         $filters = [
@@ -143,6 +141,3 @@ return [
 
     'POST admin/payments/reverify' => $todo,
 ];
-
-
-    
