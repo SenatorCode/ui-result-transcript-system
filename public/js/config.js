@@ -1,1 +1,1 @@
-window.PORTAL_CONFIG = Object.freeze({ USE_MOCKS: true, API_TIMEOUT_MS: 12000, CACHE_TTL_MS: 20000 });
+window.PORTAL_CONFIG = Object.freeze({ USE_MOCKS: false, API_TIMEOUT_MS: 12000, CACHE_TTL_MS: 20000 });
