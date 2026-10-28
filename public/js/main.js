@@ -49,6 +49,16 @@ function setBusy(button, busy, text) {
 }
 const key = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
+function restoreForm(data) {
+  const area = document.querySelector('#transcript-form-area');
+  for (const [name, value] of Object.entries(data)) {
+    area.querySelectorAll(`[name="${name}"]`).forEach(el => {
+      if (el.type === 'radio') el.checked = el.value === value; else el.value = value;
+    });
+  }
+  document.querySelector('#institution-fields').hidden = data.destinationType !== 'institution';
+}
+
 async function init() {
   const route = location.hash.replace(/^#\/?/, '').split('?')[0];
   try { const preauth = await get('auth/csrf.php', { cache: false }); setCsrfToken(preauth.csrfToken); } catch (_) { /* Login can explain the network failure when submitted. */ }
@@ -108,6 +118,7 @@ document.addEventListener('submit', async event => {
     } catch (error) {
       const message = error.status === 429 ? `${error.message}${error.error?.fields?.retryAfterSeconds ? ` Try again in ${error.error.fields.retryAfterSeconds} seconds.` : ''}` : error.status === 401 ? 'Matric number or password is incorrect.' : error.message;
       setFormError(form, message);
+      setBusy(button, false);
       if (error.status === 429) {
         const submit = form.querySelector('[type=submit]');
         let seconds = Math.max(1, Number(error.error?.fields?.retryAfterSeconds) || 30);
@@ -119,7 +130,6 @@ document.addEventListener('submit', async event => {
           else submit.textContent = `Try again in ${seconds}s`;
         }, 1000);
       }
-      setBusy(button, false);
     }
   }
   if (type === 'forgot') {
@@ -177,33 +187,60 @@ document.addEventListener('click', async event => {
     if (lastRender) await renderRoute(lastRender.route, lastRender.page, lastRender.context);
   }
   if (action === 'review-request') {
-    const button = target; setBusy(button, true, 'Getting current fee…');
-    try {
-      const module = await import('./pages/transcripts.js');
-      const area = document.querySelector('#transcript-form-area');
-      // FormData requires a form element; collect controls from the request step into a temporary form.
-      const temp = document.createElement('form'); area.querySelectorAll('input,select,textarea').forEach(control => { if (!control.name || (control.type === 'radio' && !control.checked)) return; const field = document.createElement('input'); field.name = control.name; field.value = control.value; temp.append(field); });
-      const draft = await module.reviewRequest(temp, lastRender?.context?.signal);
-      if (!draft) { setBusy(button, false); return; }
-      reviewDraft = { ...draft, formHtml: area.innerHTML }; area.innerHTML = module.reviewMarkup(draft);
-      document.querySelectorAll('.step-pill').forEach((pill, index) => pill.classList.toggle('is-current', index === 1));
-    } catch (error) { const status = document.querySelector('#quote-status'); if (status) status.textContent = error.message; }
-    finally { if (target.isConnected) setBusy(target, false); }
+  const button = target;
+  const area = document.querySelector('#transcript-form-area');
+  const formHtml = area.innerHTML; // snapshot before the button goes busy
+  setBusy(button, true, 'Getting current fee…');
+  try {
+    const module = await import('./pages/transcripts.js');
+    // FormData requires a form element; collect controls from the request step into a temporary form.
+    const temp = document.createElement('form');
+    area.querySelectorAll('input,select,textarea').forEach(control => {
+      if (!control.name || (control.type === 'radio' && !control.checked)) return;
+      const field = document.createElement('input');
+      field.name = control.name;
+      field.value = control.value;
+      temp.append(field);
+    });
+    const draft = await module.reviewRequest(temp, lastRender?.context?.signal);
+    if (!draft) { setBusy(button, false); return; }
+    reviewDraft = { ...draft, formHtml };
+    area.innerHTML = module.reviewMarkup(draft);
+    document.querySelectorAll('.step-pill').forEach((pill, index) => pill.classList.toggle('is-current', index === 1));
+  } catch (error) {
+    const status = document.querySelector('#quote-status');
+    if (status) status.textContent = error.message;
   }
-  if (action === 'edit-request' && reviewDraft) {
-    document.querySelector('#transcript-form-area').innerHTML = reviewDraft.formHtml; reviewDraft = null; requestKey = null; installTranscriptFieldBehavior();
-    document.querySelectorAll('.step-pill').forEach((pill, index) => pill.classList.toggle('is-current', index === 0));
+  finally { if (target.isConnected) setBusy(target, false); }
+}
+
+    if (action === 'edit-request' && reviewDraft) {
+    const { formHtml, data } = reviewDraft;
+    document.querySelector('#transcript-form-area').innerHTML = formHtml;
+    restoreForm(data);
+    reviewDraft = null; requestKey = null;
+    installTranscriptFieldBehavior();
+    // step-pill toggle stays as is
   }
   if (action === 'submit-request' && reviewDraft) {
     setBusy(target, true, 'Creating request…'); requestKey ||= key();
     try {
       const { data, quote } = reviewDraft;
+      const clean = { ...data };
+      if (clean.destinationType === 'personal') {
+        ['institutionName', 'destinationAddress', 'destinationEmail'].forEach(k => delete clean[k]);
+      }
       // Send only what the contract asks for: no empty strings, copies as a number.
-      const body = Object.fromEntries(Object.entries({ ...data, copies: Number(data.copies), quoteExpiresAt: quote.expiresAt }).filter(([, value]) => value !== ''));
-      await post('transcripts/create.php', body, { idempotencyKey: requestKey }); requestKey = null; reviewDraft = null;
+      const body = Object.fromEntries(
+        Object.entries({ ...clean, copies: Number(clean.copies), quoteExpiresAt: quote.expiresAt })
+          .filter(([, value]) => value !== '')
+      );
+      await post('transcripts/create.php', body, { idempotencyKey: requestKey });
+      requestKey = null; reviewDraft = null;
       showToast('Transcript request created.'); navigate('transcripts');
     } catch (error) { setBusy(target, false); showToast(error.message); }
   }
+
   if (action === 'pay' || action === 'retry-payment') {
     const id = target.dataset.id; target.disabled = true;
     const approved = await confirmAction('Confirm payment', 'You are about to start payment for this transcript. We will confirm the payment with the portal before marking it paid.', 'Continue to payment');
