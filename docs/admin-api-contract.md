@@ -235,16 +235,18 @@ Body `{}`. Only for a request in `payment_processing`. Behaves like the student 
 
 ## Pages and the endpoints they call
 
-| Page | Purpose | Calls |
-|---|---|---|
-| `admin/index.html` | Login; redirect to the dashboard if already signed in | `auth/csrf`, `auth/login`, `auth/me` |
-| `admin/dashboard.html` | Status counts, revenue, recent requests | `dashboard` |
-| `admin/requests.html` | Filterable, paged request list | `transcripts/index` |
-| `admin/request.html?id=tr_1001` | Request detail, admin action buttons, PDF link | `transcripts/show`, `transcripts/update-status`, `transcripts/document`, optionally `payments/reverify` |
-| `admin/payments.html` | Filterable, paged payment list | `payments/index` |
-| `admin/assets/admin.js`, `admin/assets/admin.css` | Shared fetch wrapper (adds the CSRF header, unwraps the envelope, sends a 401 back to login) and styles | All |
+The admin interface is a Single Page Application (SPA). There is only one physical HTML file (`index.html`). The five screens are rendered dynamically via JavaScript hash routing.
 
-Pages render buttons only from `adminActions`, ask for confirmation before `reject`, and reload the request after every action.
+| View / Route | Purpose | Calls |
+|---|---|---|
+| `admin/index.html#/login` | Login view; redirects to dashboard if already signed in | `auth/csrf`, `auth/login`, `auth/me` |
+| `admin/index.html#/dashboard` | Status counts, revenue, recent requests | `dashboard` |
+| `admin/index.html#/requests` | Filterable, paged request list | `transcripts/index` |
+| `admin/index.html#/request/<id>` | Request detail, admin action buttons, PDF link | `transcripts/show`, `transcripts/update-status`, `transcripts/document`, optionally `payments/reverify` |
+| `admin/index.html#/payments` | Filterable, paged payment list | `payments/index` |
+| `admin/admin.js`, `admin/admin.css` | SPA router, shared fetch wrapper (adds the CSRF header, unwraps the envelope, sends a 401 back to login), and styles | All |
+
+The SPA renders action buttons only from `adminActions`, asks for confirmation before `reject`, and reloads the request after every action.
 
 ## Endpoint status
 
