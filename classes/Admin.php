@@ -1,6 +1,4 @@
-
-
-  <?php
+<?php
 // Owner: Dev C (@Muyii08). Signatures aligned with Core.php and Transcript.php.
 declare(strict_types=1);
 
@@ -314,14 +312,8 @@ final class TranscriptIssuer
             // 3. Delegate to Dev B's state machine
             $updated = Transcript::transition($requestId, $action, $adminId, $reason);
 
-            // 4. Flag refund if it's a rejection of a paid request
-            $refundRequired = false;
-            if ($action === 'reject') {
-                $refundRequired = Database::execute(
-                    "UPDATE payments SET refunded_at = UTC_TIMESTAMP() WHERE request_id = ? AND status = 'success' AND refunded_at IS NULL",
-                    [$requestId]
-                ) > 0;
-            }
+           // 4. Flag refund if it's a rejection of a paid request (Dev B's method)
+              $refundRequired = ($action === 'reject') ? Payment::markRefunded($requestId) : false;
 
             // 5. Return the exact payload the frontend expects
             return [
